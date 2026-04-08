@@ -1,0 +1,31 @@
+name: Generate Daily Puzzles
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: pip install anthropic
+
+      - name: Generate puzzles
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python scripts/generate.py
+
+      - name: Commit to queue
+        run: |
+          git config user.name "Daily Puzzle Bot"
+          git config user.email "bot@dehaiku.app"
+          git add queue/ config/
+          git diff --cached --quiet || git commit -m "Generate puzzles for week of $(date +%Y-%m-%d)"
+          git push
