@@ -107,8 +107,8 @@ def _update_banned_words(puzzle):
         f.write("\n")
 
 
-def regenerate_candidates(day_str, seeds_csv=""):
-    """Re-run generate.py for a specific day. Optionally with seed words."""
+def regenerate_candidates(day_str, seeds_csv="", theme=""):
+    """Re-run generate.py for a specific day. Optionally with seed words and/or theme."""
     cmd = [
         sys.executable,
         str(REPO_ROOT / "scripts" / "generate.py"),
@@ -117,6 +117,8 @@ def regenerate_candidates(day_str, seeds_csv=""):
     ]
     if seeds_csv.strip():
         cmd.extend(["--seeds", seeds_csv.strip()])
+    if theme.strip():
+        cmd.extend(["--themes", theme.strip()])
 
     try:
         result = subprocess.run(
@@ -189,7 +191,9 @@ class ReviewHandler(http.server.BaseHTTPRequestHandler):
         if self.path == "/api/approve":
             self._json(approve_candidate(body["date"], body["pick"]))
         elif self.path == "/api/regenerate":
-            self._json(regenerate_candidates(body["date"], body.get("seeds", "")))
+            self._json(regenerate_candidates(
+                body["date"], body.get("seeds", ""), body.get("theme", "")
+            ))
         elif self.path == "/api/push":
             self._json(git_commit_and_push())
         else:
@@ -316,9 +320,10 @@ header h1{font-size:16px;font-weight:600;letter-spacing:.02em}
 <div class="date-hdr" id="dateHdr"></div>
 <div class="progress" id="progress"></div>
 <div class="regen" id="regen" style="display:none">
+  <input type="text" id="themeInput" placeholder="Optional theme override (e.g. winter wonderland)">
   <input type="text" id="seedInput" placeholder="Optional seed words (e.g. tree, gift, snow)">
   <button class="regen-btn" id="regenBtn" onclick="regenerate()">Regenerate</button>
-  <div class="hint">Re-rolls all 8 candidates. Seed words get mixed into the 12-word pool (may land as answers or decoys).</div>
+  <div class="hint">Re-rolls all 8 candidates. Theme overrides the rotation; seed words get mixed into the 12-word pool.</div>
 </div>
 <div class="grid" id="grid"></div>
 <div class="toast" id="toast"></div>
@@ -434,7 +439,11 @@ async function regenerate() {
   const day = S.cur;
   if (!day) return;
   const seeds = document.getElementById('seedInput').value.trim();
-  const label = seeds ? ' with seeds "' + seeds + '"' : '';
+  const theme = document.getElementById('themeInput').value.trim();
+  const parts = [];
+  if (theme) parts.push('theme "' + theme + '"');
+  if (seeds) parts.push('seeds "' + seeds + '"');
+  const label = parts.length ? ' with ' + parts.join(' and ') : '';
   if (!confirm('Regenerate all candidates for ' + longDate(day) + label + '?\n\nThis calls the Claude API and may take a minute.')) return;
   const btn = document.getElementById('regenBtn');
   btn.textContent = 'Generating…';
@@ -442,7 +451,7 @@ async function regenerate() {
   const res = await api('/api/regenerate', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({date: day, seeds: seeds})
+    body: JSON.stringify({date: day, seeds: seeds, theme: theme})
   });
   btn.textContent = 'Regenerate';
   btn.disabled = false;

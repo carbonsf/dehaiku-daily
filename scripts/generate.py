@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import re
 import sys
@@ -18,21 +19,27 @@ PUZZLES_DIR = REPO_ROOT / "puzzles"
 CANDIDATES_DIR = REPO_ROOT / "candidates"
 CONFIG_DIR = REPO_ROOT / "config"
 
-MODEL = "claude-opus-4-20250514"
+MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-20250514")
 LOOKAHEAD_DAYS = 7
 CANDIDATES_PER_DAY = 8
 MAX_RETRIES = 3
+HAIKU_RETRIES = 3
+
+# ── System prompt (matches production solo recipe) ───────────
 
 SYSTEM_MESSAGE = (
     "You are a haiku poet. You will receive four words. Compose a haiku that "
     "encodes all four using only their concepts — never the actual words, "
     "their roots, or close variants. Each word should be evocable from context "
     "so a player could guess all four. Use any reasonably common meaning of each "
-    "word. Return ONLY the haiku — no explanation, no commentary, no extra text.\n\n"
+    "word. Return ONLY the haiku — no explanation, no commentary, no extra text."
+    "\n\n"
     "Your audience is adults who appreciate haikus with bite. Lean into mature, "
     "edgy, and provocative territory. Dark humor, innuendo, violence, sensuality, "
     "irreverence, absurdity — all fair game. Be bold and unapologetic."
 )
+
+# ── Angle cues (novelty pool — one picked per call) ──────────
 
 ANGLE_CUES = [
     "through the lens of decay and renewal",
@@ -52,6 +59,20 @@ ANGLE_CUES = [
     "with a sense of something about to break",
     "as a memory that's slightly wrong",
 ]
+
+# ── Truncation guard allowlist (production) ──────────────────
+
+TRUNCATION_ALLOWLIST = {
+    "a", "an", "i", "is", "it", "to", "of", "on", "in", "no", "or", "as",
+    "at", "by", "be", "we", "us", "he", "she", "her", "him", "his", "my",
+    "me", "the", "and", "but", "for", "you", "are", "all", "one", "two",
+    "ten", "ice", "sky", "sea", "sun", "low", "old", "new", "red", "fly",
+    "cry", "die", "eye", "ear", "arm", "leg", "hot", "wet", "dry", "now",
+    "yes", "off", "out", "up", "go", "do", "so", "if",
+}
+
+
+# ── Config helpers ───────────────────────────────────────────
 
 
 def load_themes() -> list[str]:
@@ -92,45 +113,58 @@ def strip_code_fences(text: str) -> str:
     return text.strip()
 
 
-def validate_haiku(haiku: str, words: list[str]) -> None:
-    """Raise ValueError if any answer word or close variant appears in the haiku.
+# ── Validation (matches production server-side checks) ───────
 
-    This is the core game rule: the haiku encodes concepts, never the words
-    themselves, their roots, or obvious inflections.
+
+def looks_truncated(lines: list[str]) -> bool:
+    """True if the haiku appears cut off (production truncation guard).
+
+    Last line's final alphanumeric token must either be >3 chars or be
+    in the short-word allowlist.
     """
-    haiku_tokens = set(re.findall(r"[a-z]+", haiku.lower()))
+    if len(lines) < 3:
+        return True
+    last_tokens = re.findall(r"[a-zA-Z]+", lines[-1])
+    if not last_tokens:
+        return True
+    last_word = last_tokens[-1].lower()
+    if 1 <= len(last_word) <= 3 and last_word not in TRUNCATION_ALLOWLIST:
+        return True
+    return False
+
+
+def leaked_words(haiku: str, words: list[str]) -> list[str]:
+    """Return answer words whose text leaked into the haiku.
+
+    Production logic:
+      1. Normalize: lowercase, replace any non-[a-z0-9] with a single space
+         (so hyphens / apostrophes can't hide a stem).
+      2. Tokenize on whitespace.
+      3. For each answer word build a probe set:
+           • The full word, always.
+           • Plus first N-1 letters as a stem, only if len >= 6
+             (e.g. "hedging" (7) → also probe "hedgin";
+              "apples" (6) → also probe "apple";
+              "pear" (4) → full-word only).
+      4. If any token *contains* any probe as a substring → leaked.
+    """
+    normalized = re.sub(r"[^a-z0-9]", " ", haiku.lower())
+    tokens = normalized.split()
+
+    leaked: list[str] = []
     for w in words:
         wl = w.lower()
-        # Exact match
-        if wl in haiku_tokens:
-            raise ValueError(f"Answer word '{w}' appears verbatim in haiku")
-        # Build common inflected / derived forms
-        variants = {
-            wl + "s", wl + "es", wl + "ed", wl + "er", wl + "est",
-            wl + "ing", wl + "ly", wl + "ful", wl + "ness", wl + "ment",
-            wl + "en", wl + "ish", wl + "y",
-        }
-        # Handle trailing-e words: bake→baked/baking/baker
-        if wl.endswith("e"):
-            stem = wl[:-1]
-            variants |= {stem + "ed", stem + "ing", stem + "er", stem + "est"}
-        # Handle consonant+y: carry→carried/carries
-        if wl.endswith("y") and len(wl) > 2 and wl[-2] not in "aeiou":
-            stem = wl[:-1]
-            variants |= {stem + "ied", stem + "ies", stem + "ier", stem + "iest"}
-        found = variants & haiku_tokens
-        if found:
-            raise ValueError(
-                f"Variant '{found.pop()}' of answer word '{w}' found in haiku"
-            )
-        # Catch longer derivations: if answer is 4+ chars and a haiku token
-        # starts with it (e.g. "blood" → "bloody", "blooded")
-        if len(wl) >= 4:
-            for token in haiku_tokens:
-                if token != wl and token.startswith(wl) and len(token) <= len(wl) + 4:
-                    raise ValueError(
-                        f"Haiku word '{token}' derives from answer word '{w}'"
-                    )
+        probes = [wl]
+        if len(wl) >= 6:
+            probes.append(wl[:-1])
+
+        if any(probe in tok for tok in tokens for probe in probes):
+            leaked.append(w)
+
+    return leaked
+
+
+# ── Word pool generation ─────────────────────────────────────
 
 
 def generate_word_pool(
@@ -149,7 +183,6 @@ def generate_word_pool(
     needed = 12 - len(seeds)
 
     if needed <= 0:
-        # More seeds than slots — take 12 and shuffle
         pool = list(seeds[:12])
         random.shuffle(pool)
         return pool
@@ -177,10 +210,13 @@ def generate_word_pool(
             {
                 "role": "user",
                 "content": (
-                    f'Pick {needed} concrete, evocative words loosely related to the theme "{theme}".\n'
+                    f'Pick {needed} concrete, evocative words loosely related to '
+                    f'the theme "{theme}".\n'
                     f"Requirements:\n"
-                    f"- Each word must be a single lowercase English word (no spaces, no hyphens)\n"
-                    f"- Words should be concrete enough to clue in a haiku without using the word itself\n"
+                    f"- Each word must be a single lowercase English word "
+                    f"(no spaces, no hyphens)\n"
+                    f"- Words should be concrete enough to clue in a haiku "
+                    f"without using the word itself\n"
                     f"- Avoid these recently used words: {banned_csv}\n"
                     f"{seed_note}"
                     f"- Surprise me — skip first-association clichés\n"
@@ -193,7 +229,9 @@ def generate_word_pool(
     text = strip_code_fences(response.content[0].text)
     generated = json.loads(text)
     if len(generated) != needed:
-        raise ValueError(f"Expected {needed} words, got {len(generated)}: {generated}")
+        raise ValueError(
+            f"Expected {needed} words, got {len(generated)}: {generated}"
+        )
     for w in generated:
         if not isinstance(w, str) or not w.isalpha() or not w.islower():
             raise ValueError(f"Invalid word: {w!r}")
@@ -215,42 +253,92 @@ def generate_word_pool(
     return unique[:12]
 
 
+# ── Haiku generation (production prompt format) ──────────────
+
+
 def generate_haiku(
     client: anthropic.Anthropic,
     words: list[str],
     theme: str,
     banned_words: list[str],
     angle_cue: str | None = None,
+    leaked_feedback: list[str] | None = None,
 ) -> str:
+    """Generate a haiku encoding the given words.
+
+    User message matches the production solo recipe:
+      THEME → Words → Approach → Ban list → CONSTRAINTS block
+    On retry after a leak, appends a PREVIOUS ATTEMPT LEAKED line.
+    """
     if angle_cue is None:
         angle_cue = random.choice(ANGLE_CUES)
     seed = random.randint(1000, 9999)
 
-    user_parts = [f"Words: {', '.join(words)}"]
-    user_parts.append(f"Approach: {angle_cue}")
-    user_parts.append(
-        f'Theme: "{theme}" — weave it as mood/setting, don\'t overpower the word clues'
+    parts: list[str] = []
+
+    # Theme — first, so the model reads it before constraints
+    parts.append(
+        f"THEME (set the mood and setting — the haiku should clearly "
+        f"feel like it belongs to this theme): {theme}"
     )
+
+    # Words to encode
+    parts.append(f"Words to encode: {', '.join(words)}")
+
+    # Approach
+    parts.append(f"Consider this approach: {angle_cue}")
+
+    # Banned first-words
     if banned_words:
-        user_parts.append(
-            f"FORBIDDEN — do NOT start the haiku with any of these words: "
+        parts.append(
+            f"Do NOT start the haiku with any of these words: "
             f"{', '.join(banned_words)}"
         )
-    user_parts.append(
-        f"Avoid cliché first-association imagery. Find a surprising angle. (seed:{seed})"
+
+    # Constraints block
+    parts.append("")
+    parts.append("CONSTRAINTS (the game breaks if you violate these):")
+    parts.append(
+        "• Do not use any of the four target words anywhere in the "
+        "haiku — not in any form, tense, plural, or compound. "
+        'Not "pear" → "pear-shaped". Not "hedging" → "hedges".'
     )
+    parts.append(
+        "• Hyphens and apostrophes do not hide a leak "
+        '— "pear-shaped" still contains "pear" and is forbidden.'
+    )
+    parts.append(
+        "• Evoke each word through imagery, action, sensation, or "
+        "context. Make the player infer it."
+    )
+    parts.append(
+        "• Write three complete lines — no trailing fragments. "
+        "Avoid cliché first-association imagery. "
+        f"Find a surprising angle. (seed:{seed})"
+    )
+
+    # Leaked-word feedback from a previous failed attempt
+    if leaked_feedback:
+        parts.append("")
+        parts.append(
+            f"PREVIOUS ATTEMPT LEAKED these forbidden words: "
+            f"{', '.join(leaked_feedback)}. "
+            f"Rewrite without any of them or their stems."
+        )
 
     response = client.messages.create(
         model=MODEL,
-        max_tokens=100,
+        max_tokens=220,
         temperature=1.0,
         system=SYSTEM_MESSAGE,
-        messages=[{"role": "user", "content": "\n".join(user_parts)}],
+        messages=[{"role": "user", "content": "\n".join(parts)}],
     )
     text = response.content[0].text.strip()
     lines = [line.strip() for line in text.split("\n") if line.strip()]
     if len(lines) != 3:
         raise ValueError(f"Expected 3 lines, got {len(lines)}: {text!r}")
+    if looks_truncated(lines):
+        raise ValueError(f"Haiku looks truncated: {lines[-1]!r}")
     return "\n".join(lines)
 
 
@@ -266,7 +354,7 @@ def update_banned_words(
     return banned_words
 
 
-HAIKU_RETRIES = 3  # inner retries for haiku validation
+# ── Puzzle assembly ──────────────────────────────────────────
 
 
 def generate_puzzle(
@@ -286,25 +374,38 @@ def generate_puzzle(
             print(f"  Pool (12): {pool}")
 
             # Step 2 — randomly draw 4 as answer words; the rest are decoys
-            answer_words = pool[:4]     # pool is already shuffled
+            answer_words = pool[:4]
             decoy_words = pool[4:]
             print(f"  Answers: {answer_words}")
             print(f"  Decoys:  {decoy_words}")
 
-            # Step 3 — generate haiku encoding the 4 answer words
-            #          (retry the haiku if answer words leak into the text)
+            # Step 3 — generate haiku with leak-check retry loop
+            #          (production: up to 3 tries, feed leaked words back)
             print(f"  Generating haiku...")
             haiku = None
+            feedback: list[str] | None = None
             for h_try in range(1, HAIKU_RETRIES + 1):
-                candidate = generate_haiku(
-                    client, answer_words, theme, banned_words, angle_cue
-                )
                 try:
-                    validate_haiku(candidate, answer_words)
+                    candidate = generate_haiku(
+                        client, answer_words, theme, banned_words,
+                        angle_cue, leaked_feedback=feedback,
+                    )
+                    leaks = leaked_words(candidate, answer_words)
+                    if leaks:
+                        feedback = leaks
+                        print(
+                            f"    Haiku leaked {leaks} "
+                            f"(try {h_try}/{HAIKU_RETRIES})"
+                        )
+                        continue
                     haiku = candidate
                     break
                 except ValueError as ve:
-                    print(f"    Haiku rejected (try {h_try}/{HAIKU_RETRIES}): {ve}")
+                    print(
+                        f"    Haiku rejected "
+                        f"(try {h_try}/{HAIKU_RETRIES}): {ve}"
+                    )
+
             if haiku is None:
                 raise ValueError(
                     "Could not generate a valid haiku — answer words keep "
@@ -312,7 +413,9 @@ def generate_puzzle(
                 )
             print(f"  Haiku:\n    " + haiku.replace("\n", "\n    "))
 
-            banned_words = update_banned_words(haiku, list(banned_words), max_size)
+            banned_words = update_banned_words(
+                haiku, list(banned_words), max_size
+            )
 
             puzzle = {
                 "date": d.isoformat(),
@@ -327,23 +430,35 @@ def generate_puzzle(
             print(f"  Attempt {attempt} failed: {e}")
             if attempt == MAX_RETRIES:
                 raise RuntimeError(
-                    f"Failed to generate puzzle for {d} after {MAX_RETRIES} attempts"
+                    f"Failed to generate puzzle for {d} "
+                    f"after {MAX_RETRIES} attempts"
                 ) from e
 
     raise RuntimeError("Unreachable")
 
 
+# ── CLI ──────────────────────────────────────────────────────
+
+
 def parse_args():
-    p = argparse.ArgumentParser(description="Generate candidate De-Haiku-ifier puzzles")
+    p = argparse.ArgumentParser(
+        description="Generate candidate De-Haiku-ifier puzzles"
+    )
     p.add_argument(
         "--day",
-        help="Generate for a specific date (YYYY-MM-DD) instead of the next 7 days",
+        help="Start date (YYYY-MM-DD). Defaults to tomorrow.",
+    )
+    p.add_argument(
+        "--themes",
+        help='Comma-separated theme list — one theme per day, overrides '
+        "the rotation. Number of themes = number of days generated. "
+        'E.g. "winter wonderland,cozy cabin,holiday feast"',
     )
     p.add_argument(
         "--seeds",
         help="Comma-separated words to sprinkle into the 12-word pool "
-        '(e.g. "tree,gift,snow" for a holiday). They may land as answers '
-        "or decoys — the draw is random.",
+        '(e.g. "tree,gift,snow" for a holiday). They may land as '
+        "answers or decoys — the draw is random.",
     )
     p.add_argument(
         "--force",
@@ -356,34 +471,65 @@ def parse_args():
 def main() -> None:
     args = parse_args()
     client = anthropic.Anthropic()
-    themes = load_themes()
+    rotation_themes = load_themes()
     banned_words, max_size = load_banned_words()
 
     # Parse optional seed words
     seed_words = None
     if args.seeds:
-        seed_words = [w.strip().lower() for w in args.seeds.split(",") if w.strip()]
+        seed_words = [
+            w.strip().lower() for w in args.seeds.split(",") if w.strip()
+        ]
         if not seed_words or len(seed_words) > 11:
-            print("Error: --seeds takes 1-11 comma-separated words (pool is 12)")
+            print("Error: --seeds takes 1-11 words (pool is 12)")
             sys.exit(1)
         print(f"Seed words ({len(seed_words)}): {seed_words}")
 
-    # Determine which days to generate
+    # Parse optional explicit theme list
+    explicit_themes: list[str] | None = None
+    if args.themes:
+        explicit_themes = [
+            t.strip() for t in args.themes.split(",") if t.strip()
+        ]
+        if not explicit_themes:
+            print("Error: --themes requires at least one theme")
+            sys.exit(1)
+
+    # Determine start date
     today = date.today()
-    if args.day:
-        days_to_generate = [date.fromisoformat(args.day)]
+    start = date.fromisoformat(args.day) if args.day else today + timedelta(days=1)
+
+    # Build (date, theme) pairs
+    if explicit_themes:
+        # --themes drives the number of days
+        day_themes = [
+            (start + timedelta(days=i), theme)
+            for i, theme in enumerate(explicit_themes)
+        ]
+    elif args.day and not explicit_themes:
+        # --day alone: single day, rotation theme
+        day_themes = [(start, get_theme_for_date(start, rotation_themes))]
     else:
-        days_to_generate = [today + timedelta(days=i) for i in range(1, LOOKAHEAD_DAYS + 1)]
+        # Default: next 7 days, rotation themes
+        day_themes = [
+            (
+                today + timedelta(days=i),
+                get_theme_for_date(today + timedelta(days=i), rotation_themes),
+            )
+            for i in range(1, LOOKAHEAD_DAYS + 1)
+        ]
 
     generated_days = 0
 
-    for d in days_to_generate:
+    for d, theme in day_themes:
         if not args.force and (puzzle_approved(d) or candidates_exist(d)):
             print(f"Skipping {d} — already has candidates or approved puzzle")
             continue
 
-        theme = get_theme_for_date(d, themes)
-        print(f"\nGenerating {CANDIDATES_PER_DAY} candidates for {d} (theme: {theme})...")
+        print(
+            f"\nGenerating {CANDIDATES_PER_DAY} candidates "
+            f"for {d} (theme: {theme})..."
+        )
 
         day_dir = CANDIDATES_DIR / d.isoformat()
         day_dir.mkdir(parents=True, exist_ok=True)
@@ -394,7 +540,9 @@ def main() -> None:
                 f.unlink()
 
         # Pick distinct angle cues — one per candidate for diversity
-        angles = random.sample(ANGLE_CUES, min(CANDIDATES_PER_DAY, len(ANGLE_CUES)))
+        angles = random.sample(
+            ANGLE_CUES, min(CANDIDATES_PER_DAY, len(ANGLE_CUES))
+        )
 
         for n in range(1, CANDIDATES_PER_DAY + 1):
             angle = angles[(n - 1) % len(angles)]
@@ -413,7 +561,9 @@ def main() -> None:
 
     print(f"\nDone. Generated candidates for {generated_days} day(s).")
     if generated_days:
-        print("Run 'python scripts/review.py' to review and approve puzzles.")
+        print(
+            "Run 'python scripts/review.py' to review and approve puzzles."
+        )
 
 
 if __name__ == "__main__":
