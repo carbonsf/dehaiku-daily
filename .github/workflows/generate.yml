@@ -22,10 +22,10 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: python scripts/generate.py
 
-      - name: Commit to queue
+      - name: Commit candidates
         run: |
           git config user.name "Daily Puzzle Bot"
           git config user.email "bot@dehaiku.app"
-          git add queue/ config/
-          git diff --cached --quiet || git commit -m "Generate puzzles for week of $(date +%Y-%m-%d)"
+          git add -f candidates/ config/
+          git diff --cached --quiet || git commit -m "Generate candidates for week of $(date +%Y-%m-%d)"
           git push
