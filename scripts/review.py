@@ -84,6 +84,20 @@ def approve_candidate(day_str, pick_num):
     return {"ok": True, "message": f"Approved → puzzles/{y}/{m}/{d}.json"}
 
 
+def unapprove_day(day_str):
+    """Remove the approved puzzle for a day so it can be re-picked."""
+    y, m, d = day_str.split("-")
+    puzzle_file = PUZZLES_DIR / y / m / f"{d}.json"
+    if not puzzle_file.exists():
+        return {"ok": False, "message": f"No approved puzzle for {day_str}"}
+    puzzle_file.unlink()
+    # Clean up empty parent dirs
+    for parent in [puzzle_file.parent, puzzle_file.parent.parent]:
+        if parent != PUZZLES_DIR and parent.is_dir() and not any(parent.iterdir()):
+            parent.rmdir()
+    return {"ok": True, "message": f"Unapproved {day_str} — pick again"}
+
+
 def _update_banned_words(puzzle):
     """Add the approved haiku's first word to the banned list."""
     banned_file = CONFIG_DIR / "banned-words.json"
@@ -190,6 +204,8 @@ class ReviewHandler(http.server.BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(length)) if length else {}
         if self.path == "/api/approve":
             self._json(approve_candidate(body["date"], body["pick"]))
+        elif self.path == "/api/unapprove":
+            self._json(unapprove_day(body["date"]))
         elif self.path == "/api/regenerate":
             self._json(regenerate_candidates(
                 body["date"], body.get("seeds", ""), body.get("theme", "")
@@ -307,6 +323,10 @@ header h1{font-size:16px;font-weight:600;letter-spacing:.02em}
 .regen-btn:hover{background:#ea580c}
 .regen-btn:disabled{opacity:.5;cursor:not-allowed}
 .regen .hint{font-size:11px;color:var(--muted);width:100%;text-align:center}
+
+/* ── Unapprove ─────────────────────────── */
+.unapprove-btn{margin-top:12px;padding:6px 18px;background:transparent;color:var(--muted);border:1px solid var(--border);border-radius:6px;font-size:13px;cursor:pointer;font-family:inherit;transition:all .15s}
+.unapprove-btn:hover{color:#dc2626;border-color:#dc2626}
 </style>
 </head>
 <body>
@@ -383,7 +403,8 @@ async function selectDay(day) {
 
   if (info && info.approved) {
     hdr.innerHTML = '<h2>' + longDate(day) + '</h2><div class="meta">Approved</div>';
-    grid.innerHTML = '<div class="state ok"><div class="icon">✓</div>Puzzle approved for this day.</div>';
+    grid.innerHTML = '<div class="state ok"><div class="icon">✓</div>Puzzle approved for this day.'
+      + '<br><button class="unapprove-btn" onclick="unapprove(\'' + day + '\')">Unapprove</button></div>';
     regenBar.style.display = 'none';
     return;
   }
@@ -480,6 +501,25 @@ async function pushToGithub() {
   btn.textContent = 'Commit & Push';
   btn.disabled = false;
   toast(res.message);
+}
+
+/* ── Unapprove ─────────────────────────── */
+async function unapprove(day) {
+  if (!confirm('Unapprove ' + longDate(day) + '?\n\nYou can re-pick from the candidates.')) return;
+  const res = await api('/api/unapprove', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({date: day})
+  });
+  if (res.ok) {
+    toast(res.message);
+    S.days = await api('/api/status');
+    renderNav();
+    renderProgress();
+    selectDay(day);
+  } else {
+    alert('Error: ' + res.message);
+  }
 }
 
 /* ── Helpers ────────────────────────────── */
