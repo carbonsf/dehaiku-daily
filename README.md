@@ -1,13 +1,41 @@
 # De-Haiku-ifier Daily Pipeline
 
-Static puzzle pipeline for the De-Haiku-ifier iOS game. Puzzles are generated via Claude API, reviewed editorially through a local web UI, and served as static JSON from this repo.
+Static puzzle pipeline for the De-Haiku-ifier iOS game. Puzzles are generated locally via Claude API, reviewed editorially through a local web UI, and served as static JSON from this repo.
+
+## iOS App Integration
+
+```
+GET https://raw.githubusercontent.com/carbonsf/dehaiku-daily/main/puzzles/{YYYY}/{MM}/{DD}.json
+
+Example: /puzzles/2026/05/31.json
+404 = no puzzle for that date (not yet generated or doesn't exist)
+```
+
+Response shape:
+```json
+{
+  "date": "2026-05-31",
+  "haiku": "line one\nline two\nline three",
+  "words": ["answer1", "answer2", "answer3", "answer4"],
+  "decoys": ["d1", "d2", "d3", "d4", "d5", "d6", "d7", "d8"],
+  "theme": "zen garden"
+}
+```
+
+App logic:
+- Request today's date only — never future dates
+- `words` (4) + `decoys` (8) = 12 total — shuffle before display
+- Player guesses which 4 words the haiku encodes
+- Haiku never contains the answer words (enforced at generation)
+- `theme` is metadata only (display optional)
+- `\n` separates haiku lines (always exactly 3)
 
 ## How it works
 
 1. **Generate** — `scripts/generate.py` creates 8 candidate puzzles per day using the Claude API
 2. **Review** — `scripts/review.py` launches a local web UI to browse candidates and pick winners
 3. **Push** — Approved puzzles are committed and pushed to GitHub from the review UI
-4. **Serve** — iOS app fetches puzzles from `https://raw.githubusercontent.com/carbonsf/dehaiku-daily/main/puzzles/{YYYY}/{MM}/{DD}.json`
+4. **Serve** — iOS app fetches from the URL above
 
 ## Quick start
 
@@ -17,10 +45,10 @@ pip install anthropic
 export ANTHROPIC_API_KEY="sk-ant-..."   # add to ~/.zshrc for persistence
 
 # Generate candidates for the next 7 days
-python3 /Users/carbon/Documents/daily-haiku/scripts/generate.py
+python3 scripts/generate.py
 
 # Open the review interface
-python3 /Users/carbon/Documents/daily-haiku/scripts/review.py
+python3 scripts/review.py
 ```
 
 ## Repo structure
@@ -32,14 +60,13 @@ candidates/           <- generated options awaiting review (gitignored)
   2026-05-31/
     1.json ... 8.json
 config/
+  words.json          <- dictionary (5k+ words, same as iOS app ships)
   themes.json         <- theme rotation schedule
   banned-words.json   <- FIFO list to prevent haiku first-word repetition
 scripts/
   generate.py         <- puzzle generation (Claude API)
   review.py           <- local web review server
   purge.py            <- unapprove/delete future puzzles
-.github/workflows/
-  generate.yml        <- weekly auto-generation via GitHub Actions
 ```
 
 ## Puzzle JSON format
@@ -66,10 +93,10 @@ Players see all 12 words (4 answers + 8 decoys) and the haiku, then guess which 
 # Default: generate 8 candidates/day for the next 7 days
 python3 scripts/generate.py
 
-# Custom themes (one per day, N themes = N days)
+# Override themes (cycles across days — all 8 candidates per day share one theme)
 python3 scripts/generate.py --themes "winter wonderland,cozy cabin,holiday feast"
 
-# Specific start date
+# Specific start date (single day)
 python3 scripts/generate.py --day 2026-06-15
 
 # Seed words mixed into the 12-word pool (may land as answers or decoys)
@@ -83,16 +110,27 @@ python3 scripts/generate.py --day 2026-12-25 --themes "christmas" --seeds "tree,
 ```
 
 **How generation works:**
-1. Build a 12-word pool (seed words + API-generated words for the theme)
-2. Randomly draw 4 as answer words; the remaining 8 become decoys
-3. Generate a haiku encoding the 4 answer words (production prompt with CONSTRAINTS block)
+1. Draw 12 random words from `config/words.json` (+ any user seeds) — words are NOT themed
+2. Randomly split: 4 answer words, 8 decoys
+3. Generate a haiku encoding the 4 answers — theme applied HERE (sets mood/setting only)
 4. Leak check: if any answer word or its stem appears in the haiku, retry with feedback
 5. Truncation guard: verify the haiku isn't cut off
-6. Repeat 8 times with distinct creative "angle cues" for diversity
+6. **Line structure** (two layers, both feed specific feedback into the retry — the base prompt is never touched):
+   - *Layer 1 — deterministic, free:* reject commas, any mid-line break in the last line, more than one cut in the poem, or a line ending on a function word (`the`, `of`, `like`…)
+   - *Layer 2 — Sonnet craft probe:* judges line integrity only (no knowledge of the hidden words) — catches noun phrases split across a line break and last lines stitched from fragments
+   - Runs before the gate so a structurally dead haiku never costs an Opus gate call
+7. **Gate** (matches production): two solver probes check the puzzle against the full 12-word pool:
+   - *Obvious probe* (sonnet, casual skim) — if it gets 4/4, puzzle is too easy → regenerate
+   - *Trace probe* (opus, careful solve) — any answer it can't find is unfair → regenerate
+   - Up to 4 gate retries with craft-preserving feedback per word pool, 6 pools max (24 total tries)
+   - Zero-trace (unfindable word) = hard fail, always rejected
+   - Too-obvious = soft fail — tracks the best fair candidate; ships immediately on a full pass, falls back to fair-but-obvious if all 24 tries are obvious
+8. Repeat 8 times with distinct angle cues for diversity
+9. Each candidate's first word is banned for the next, preventing repetitive openings
 
 **Environment variables:**
 - `ANTHROPIC_API_KEY` — required
-- `ANTHROPIC_MODEL` — override model (default: `claude-opus-4-20250514`)
+- `ANTHROPIC_MODEL` — override model (default: `claude-opus-4-8`)
 
 ### `review.py` — Pick winners
 
@@ -143,12 +181,6 @@ python3 scripts/review.py
 #    (or manually: git add puzzles/ config/ && git commit && git push)
 ```
 
-## CI / GitHub Actions
-
-The workflow (`.github/workflows/generate.yml`) runs every Monday at 6:00 UTC and generates candidates for the week. You can also trigger it manually from the Actions tab.
-
-**Required secret:** Add `ANTHROPIC_API_KEY` to repo Settings → Secrets and variables → Actions.
-
 ## Theme rotation
 
 Themes cycle through `config/themes.json`:
@@ -156,8 +188,8 @@ Themes cycle through `config/themes.json`:
 ["nature", "urban life", "seasons", "emotions", "food & drink", "travel", "nostalgia"]
 ```
 
-Each day maps to a theme by `(day_of_year % len(themes))`. Override with `--themes` on the CLI or the theme field in the review UI's regenerate bar.
+Default: each day maps to a theme by `(day_of_year % len(themes))`. Override with `--themes` on the CLI or the theme field in the review UI's regenerate bar.
 
 ## Banned words
 
-`config/banned-words.json` tracks a FIFO list of haiku first-words (max 50) to prevent repetitive openings. Updated automatically when you approve a puzzle.
+`config/banned-words.json` tracks a FIFO list of haiku first-words (max 50) to prevent repetitive openings. Updated automatically when you approve a puzzle. During generation, first words are also tracked per-batch so all 8 candidates start differently.

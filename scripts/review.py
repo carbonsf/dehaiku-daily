@@ -12,9 +12,11 @@ from generated candidates.
 import http.server
 import json
 import re
+import shutil
 import subprocess
 import sys
 import webbrowser
+from datetime import date
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -27,19 +29,53 @@ PORT = 8000
 # ── Data helpers ─────────────────────────────────────────────
 
 
-def get_review_status():
-    """Return list of {date, approved, count} for all days with candidates."""
+def purge_past_candidates():
+    """Remove candidate dirs for dates before today."""
     if not CANDIDATES_DIR.exists():
-        return []
-    days = []
-    for d in sorted(CANDIDATES_DIR.iterdir()):
+        return
+    today_str = date.today().isoformat()
+    for d in list(CANDIDATES_DIR.iterdir()):
         if not d.is_dir() or not re.match(r"\d{4}-\d{2}-\d{2}$", d.name):
             continue
-        y, m, day = d.name.split("-")
-        approved = (PUZZLES_DIR / y / m / f"{day}.json").exists()
-        count = len(list(d.glob("*.json")))
-        if count > 0:
-            days.append({"date": d.name, "approved": approved, "count": count})
+        if d.name < today_str:
+            shutil.rmtree(d)
+
+
+def get_review_status():
+    """Return list of {date, approved, count} for today + future days."""
+    today_str = date.today().isoformat()
+    seen = set()
+    days = []
+
+    # Days with candidates
+    if CANDIDATES_DIR.exists():
+        for d in sorted(CANDIDATES_DIR.iterdir()):
+            if not d.is_dir() or not re.match(r"\d{4}-\d{2}-\d{2}$", d.name):
+                continue
+            if d.name < today_str:
+                continue
+            y, m, day = d.name.split("-")
+            approved = (PUZZLES_DIR / y / m / f"{day}.json").exists()
+            count = len(list(d.glob("*.json")))
+            if count > 0:
+                days.append({"date": d.name, "approved": approved, "count": count})
+                seen.add(d.name)
+
+    # Approved days without candidate dirs (candidates purged after commit)
+    if PUZZLES_DIR.exists():
+        for year_dir in sorted(PUZZLES_DIR.iterdir()):
+            if not year_dir.is_dir() or not re.match(r"\d{4}$", year_dir.name):
+                continue
+            for month_dir in sorted(year_dir.iterdir()):
+                if not month_dir.is_dir() or not re.match(r"\d{2}$", month_dir.name):
+                    continue
+                for pf in sorted(month_dir.glob("*.json")):
+                    ds = f"{year_dir.name}-{month_dir.name}-{pf.stem}"
+                    if ds < today_str or ds in seen:
+                        continue
+                    days.append({"date": ds, "approved": True, "count": 0})
+
+    days.sort(key=lambda x: x["date"])
     return days
 
 
@@ -55,6 +91,16 @@ def get_candidates(day_str):
         data["_num"] = int(f.stem)
         candidates.append(data)
     return candidates
+
+
+def get_approved_puzzle(day_str):
+    """Return the approved puzzle for a day, or None."""
+    y, m, d = day_str.split("-")
+    puzzle_file = PUZZLES_DIR / y / m / f"{d}.json"
+    if not puzzle_file.exists():
+        return None
+    with open(puzzle_file) as f:
+        return json.load(f)
 
 
 def approve_candidate(day_str, pick_num):
@@ -196,6 +242,10 @@ class ReviewHandler(http.server.BaseHTTPRequestHandler):
         elif self.path.startswith("/api/candidates/"):
             day = self.path.rsplit("/", 1)[-1]
             self._json(get_candidates(day))
+        elif self.path.startswith("/api/puzzle/"):
+            day = self.path.rsplit("/", 1)[-1]
+            puzzle = get_approved_puzzle(day)
+            self._json(puzzle if puzzle else {"error": "not found"})
         else:
             self.send_error(404)
 
@@ -293,6 +343,7 @@ header h1{font-size:16px;font-weight:600;letter-spacing:.02em}
 /* ── Card ───────────────────────────────── */
 .card{background:var(--surface);border:2px solid var(--border);border-radius:12px;padding:20px;display:flex;flex-direction:column;transition:border-color .15s,box-shadow .15s}
 .card:hover{border-color:#b0b0b0;box-shadow:0 2px 12px rgba(0,0,0,.06)}
+.card.approved-card{border-color:var(--green-bdr);background:var(--green-bg);max-width:420px}
 .card-num{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
 .haiku{font-family:Georgia,'Times New Roman',serif;font-style:italic;font-size:15px;line-height:2;text-align:center;padding:14px 8px;margin:10px 0 14px;border-top:1px solid var(--border);border-bottom:1px solid var(--border);white-space:pre-line}
 .sec-label{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:5px}
@@ -402,9 +453,24 @@ async function selectDay(day) {
   var regenBar = document.getElementById('regen');
 
   if (info && info.approved) {
-    hdr.innerHTML = '<h2>' + longDate(day) + '</h2><div class="meta">Approved</div>';
-    grid.innerHTML = '<div class="state ok"><div class="icon">✓</div>Puzzle approved for this day.'
-      + '<br><button class="unapprove-btn" onclick="unapprove(\'' + day + '\')">Unapprove</button></div>';
+    var puzzle = await api('/api/puzzle/' + day);
+    if (puzzle && !puzzle.error) {
+      hdr.innerHTML = '<h2>' + longDate(day) + '</h2>'
+        + '<div class="meta">Approved · Theme: ' + esc(puzzle.theme || '—') + '</div>';
+      grid.innerHTML = '<div class="card approved-card">'
+        + '<div class="card-num">Approved Puzzle</div>'
+        + '<div class="haiku">' + esc(puzzle.haiku) + '</div>'
+        + '<div class="sec-label">Answers (' + puzzle.words.length + ')</div>'
+        + '<div class="pills">' + puzzle.words.map(function(w) { return '<span class="pill ans">' + esc(w) + '</span>'; }).join('') + '</div>'
+        + '<div class="sec-label">Decoys (' + puzzle.decoys.length + ')</div>'
+        + '<div class="pills">' + puzzle.decoys.map(function(w) { return '<span class="pill dec">' + esc(w) + '</span>'; }).join('') + '</div>'
+        + '<button class="unapprove-btn" onclick="unapprove(\'' + day + '\')">Unapprove</button>'
+        + '</div>';
+    } else {
+      hdr.innerHTML = '<h2>' + longDate(day) + '</h2><div class="meta">Approved</div>';
+      grid.innerHTML = '<div class="state ok"><div class="icon">✓</div>Puzzle approved.'
+        + '<br><button class="unapprove-btn" onclick="unapprove(\'' + day + '\')">Unapprove</button></div>';
+    }
     regenBar.style.display = 'none';
     return;
   }
@@ -553,6 +619,8 @@ init();
 
 
 if __name__ == "__main__":
+    purge_past_candidates()
+
     if not CANDIDATES_DIR.exists() or not any(CANDIDATES_DIR.iterdir()):
         print("No candidates found. Run 'python scripts/generate.py' first.")
         print("Starting server anyway...\n")
