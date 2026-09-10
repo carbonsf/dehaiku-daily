@@ -366,6 +366,11 @@ def generate_haiku(
         "separate clues."
     )
     parts.append(
+        "• Use NO commas. Never tack a fourth clue onto the end of a line "
+        'as a trailing tail (e.g. "...the sea exhales, a coin sinks") — '
+        "weave every word into the single image, not a list."
+    )
+    parts.append(
         "• Make the player infer each word from the scene; avoid "
         "one-word synonym giveaways."
     )
