@@ -27,6 +27,21 @@ MAX_POOL_ATTEMPTS = 6
 HAIKU_RETRIES = 5
 GATE_BUDGET = 4
 
+# ── API helpers ─────────────────────────────────────────────
+
+
+def _response_text(response) -> str:
+    """Return the first text block of a Messages response, or "".
+
+    Newer models may emit a thinking block before the text block, so
+    content[0] is not guaranteed to be text.
+    """
+    for block in response.content:
+        if getattr(block, "type", None) == "text":
+            return block.text
+    return ""
+
+
 # ── Prompt (v8 poem-first — matches production web/lib/prompts.ts) ──
 
 POEM_FIRST_RULES = (
@@ -403,9 +418,9 @@ def generate_haiku(
         system=SYSTEM_MESSAGE,
         messages=[{"role": "user", "content": "\n".join(parts)}],
     )
-    if not response.content:
+    text = _response_text(response).strip()
+    if not text:
         raise ValueError("Empty API response (likely content filter)")
-    text = response.content[0].text.strip()
     lines = [line.strip() for line in text.split("\n") if line.strip()]
     if len(lines) != 3:
         raise ValueError(f"Expected 3 lines, got {len(lines)}: {text!r}")
@@ -533,9 +548,7 @@ def craft_probe(client: anthropic.Anthropic, haiku: str) -> tuple[bool, str]:
         system=CRAFT_SYSTEM,
         messages=[{"role": "user", "content": haiku}],
     )
-    if not response.content:
-        return True, ""
-    obj = _extract_json(response.content[0].text)
+    obj = _extract_json(_response_text(response))
     if not obj or obj.get("ok", True):
         return True, ""
     return False, str(obj.get("issue", "a line is fragmented"))
@@ -565,7 +578,7 @@ def gate_probe(
 
     too_obvious = False
     try:
-        obv_picks = _extract_picks(obv_response.content[0].text, pool)
+        obv_picks = _extract_picks(_response_text(obv_response), pool)
         too_obvious = (
             len(obv_picks) == 4
             and all(p in answer_set for p in obv_picks)
@@ -575,7 +588,7 @@ def gate_probe(
 
     zero_trace: list[str] = []
     try:
-        trace_picks = _extract_picks(trace_response.content[0].text, pool)
+        trace_picks = _extract_picks(_response_text(trace_response), pool)
         zero_trace = [a for a in answers if a.lower() not in trace_picks]
     except Exception:
         pass
