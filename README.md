@@ -43,6 +43,9 @@ App logic:
 # One-time setup
 pip install anthropic
 export ANTHROPIC_API_KEY="sk-ant-..."   # add to ~/.zshrc for persistence
+# or put it in a gitignored .env at the repo root (works for the review UI
+# regardless of which terminal started it):
+#   echo 'ANTHROPIC_API_KEY=sk-ant-...' > .env
 
 # Generate candidates for the next 7 days
 python3 scripts/generate.py
@@ -129,7 +132,7 @@ python3 scripts/generate.py --day 2026-12-25 --themes "christmas" --seeds "tree,
 9. Each candidate's first word is banned for the next, preventing repetitive openings
 
 **Environment variables:**
-- `ANTHROPIC_API_KEY` — required
+- `ANTHROPIC_API_KEY` — required (env var, or `ANTHROPIC_API_KEY=...` in `.env` at the repo root)
 - `ANTHROPIC_MODEL` — override model (default: `claude-opus-4-8`)
 
 ### `review.py` — Pick winners

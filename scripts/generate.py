@@ -42,6 +42,28 @@ def _response_text(response) -> str:
     return ""
 
 
+def load_api_key() -> str | None:
+    """Resolve the Anthropic API key: env var first, then REPO_ROOT/.env.
+
+    The review server runs this script as a subprocess and inherits the
+    environment of whatever shell started it, so a key exported in a
+    different terminal tab is invisible to it. A .env file (gitignored)
+    works from either entry point.
+    """
+    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if key:
+        return key
+    env_file = REPO_ROOT / ".env"
+    if env_file.exists():
+        for line in env_file.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("ANTHROPIC_API_KEY="):
+                val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                if val:
+                    return val
+    return None
+
+
 # ── Prompt (v8 poem-first — matches production web/lib/prompts.ts) ──
 
 POEM_FIRST_RULES = (
@@ -801,7 +823,14 @@ def parse_args():
 
 def main() -> None:
     args = parse_args()
-    client = anthropic.Anthropic()
+    api_key = load_api_key()
+    if not api_key:
+        print(
+            "Error: ANTHROPIC_API_KEY not set. Export it in this shell, or "
+            "put ANTHROPIC_API_KEY=sk-ant-... in a .env file at the repo root."
+        )
+        sys.exit(1)
+    client = anthropic.Anthropic(api_key=api_key)
     dictionary = load_dictionary()
     rotation_themes = load_themes()
     banned_words, max_size = load_banned_words()

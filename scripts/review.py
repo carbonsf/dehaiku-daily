@@ -11,6 +11,7 @@ from generated candidates.
 
 import http.server
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -180,9 +181,25 @@ def regenerate_candidates(day_str, seeds_csv="", theme=""):
     if theme.strip():
         cmd.extend(["--themes", theme.strip()])
 
+    # Resolve the key here so a missing key is a clear message instead of
+    # a traceback, and pass it explicitly — this server may have been
+    # started from a shell that never exported it.
+    from generate import load_api_key
+    api_key = load_api_key()
+    if not api_key:
+        return {
+            "ok": False,
+            "message": (
+                "ANTHROPIC_API_KEY not set. Export it in the shell that runs "
+                "review.py, or put ANTHROPIC_API_KEY=sk-ant-... in a .env "
+                "file at the repo root, then restart review.py."
+            ),
+        }
+
     try:
         result = subprocess.run(
-            cmd, cwd=REPO_ROOT, capture_output=True, text=True, timeout=600
+            cmd, cwd=REPO_ROOT, capture_output=True, text=True, timeout=600,
+            env={**os.environ, "ANTHROPIC_API_KEY": api_key},
         )
         if result.returncode == 0:
             return {"ok": True, "message": "Regenerated candidates.", "log": result.stdout}

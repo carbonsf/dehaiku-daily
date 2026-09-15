@@ -1,3 +1,4 @@
 candidates/
 __pycache__/
 *.pyc
+.env
