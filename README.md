@@ -147,7 +147,7 @@ The review UI provides:
 - **8 candidate cards** per day with haiku, answers, and decoys
 - **Pick button** — approve a candidate (auto-advances to next day)
 - **Unapprove button** — undo an approval to re-pick
-- **Regenerate bar** — re-roll all candidates with optional theme override and seed words
+- **Regenerate bar** — re-roll all candidates with optional theme override and seed words. Runs `generate.py` as a subprocess (always the current version on disk) and shows a live panel: one bar per candidate, the current stage (drawing words, writing, rewriting and why, solver probes), the generator's output feed, elapsed time, and a Stop button. Cards appear in the grid as each candidate passes the gate.
 - **Commit & Push** — stage and push all approved puzzles to GitHub
 
 ### `purge.py` — Unapprove / delete
