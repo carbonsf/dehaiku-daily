@@ -160,6 +160,42 @@ def puzzle_approved(d: date) -> bool:
     return puzzle_file.exists()
 
 
+def select_days(
+    today: date,
+    explicit_day: str | None = None,
+    n_themes: int = 0,
+    force: bool = False,
+    approved=puzzle_approved,
+) -> list[date]:
+    """Choose which days to generate for.
+
+    Today is included when it has no approved puzzle — otherwise the app
+    has nothing to serve today and you would need --force to fix it.
+    Once today is approved the window starts tomorrow, so a routine run
+    never re-rolls the puzzle that is already live.
+
+    --day always wins and names a single day. With --themes, scan forward
+    skipping approved days so every theme lands on a day that needs one.
+    Otherwise take a LOOKAHEAD_DAYS window; the caller skips approved
+    days inside it.
+    """
+    if explicit_day:
+        return [date.fromisoformat(explicit_day)]
+
+    start = today if (force or not approved(today)) else today + timedelta(days=1)
+
+    if n_themes:
+        days: list[date] = []
+        d = start
+        while len(days) < n_themes:
+            if force or not approved(d):
+                days.append(d)
+            d += timedelta(days=1)
+        return days
+
+    return [start + timedelta(days=i) for i in range(LOOKAHEAD_DAYS)]
+
+
 # ── Syllable counting (5/7/5 validation) ───────────────────
 
 def count_syllables(word: str) -> int:
@@ -857,27 +893,15 @@ def main() -> None:
             print("Error: --themes requires at least one theme")
             sys.exit(1)
 
-    # Determine start date
     today = date.today()
-    start = date.fromisoformat(args.day) if args.day else today + timedelta(days=1)
-
-    # Build (date, theme) pairs
-    if args.day:
-        # Single day — explicit date
-        days = [start]
-    elif explicit_themes:
-        # With --themes: scan forward from tomorrow, skip approved days,
-        # collect at least len(themes) unapproved days so no theme is wasted.
-        need = len(explicit_themes)
-        days = []
-        d = today + timedelta(days=1)
-        while len(days) < need:
-            if args.force or not puzzle_approved(d):
-                days.append(d)
-            d += timedelta(days=1)
-    else:
-        # Default: next 7 days
-        days = [today + timedelta(days=i) for i in range(1, LOOKAHEAD_DAYS + 1)]
+    days = select_days(
+        today=today,
+        explicit_day=args.day,
+        n_themes=len(explicit_themes) if explicit_themes else 0,
+        force=args.force,
+    )
+    if not args.day and days and days[0] == today:
+        print("Today has no approved puzzle — starting from today.")
 
     themes_pool = explicit_themes if explicit_themes else rotation_themes
     day_themes = [

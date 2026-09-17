@@ -47,7 +47,7 @@ export ANTHROPIC_API_KEY="sk-ant-..."   # add to ~/.zshrc for persistence
 # regardless of which terminal started it):
 #   echo 'ANTHROPIC_API_KEY=sk-ant-...' > .env
 
-# Generate candidates for the next 7 days
+# Generate candidates for the next 7 days (today included if it's blank)
 python3 scripts/generate.py
 
 # Open the review interface
@@ -93,7 +93,9 @@ Players see all 12 words (4 answers + 8 decoys) and the haiku, then guess which 
 ### `generate.py` — Create candidates
 
 ```bash
-# Default: generate 8 candidates/day for the next 7 days
+# Default: 8 candidates/day for a 7-day window.
+# Starts at TODAY if today has no approved puzzle, else tomorrow.
+# Approved days inside the window are skipped.
 python3 scripts/generate.py
 
 # Override themes (cycles across days — all 8 candidates per day share one theme)
