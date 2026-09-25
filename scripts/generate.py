@@ -23,11 +23,13 @@ MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-opus-5-5")
 CASUAL_MODEL = os.environ.get("ANTHROPIC_CASUAL_MODEL", "claude-sonnet-5")
 
 # Opus 5.5 thinks on every call and thinking cannot be turned off, so
-# effort is the only dial for depth/cost. Its default is "medium", one
-# level below the older Opus default — set it explicitly so a version
-# bump never silently changes how hard the model works.
-# Tunable: "low" | "medium" | "high" | "xhigh" | "max".
-EFFORT = os.environ.get("ANTHROPIC_EFFORT", "medium")
+# effort is the only dial for how hard it works. The model's own default
+# is "medium" — set it explicitly so that default moving never silently
+# changes the poetry. This is a batch job with nobody waiting on it, and
+# a weak haiku costs far more than the tokens: it burns gate retries and
+# fresh word pools. Never run this below "high".
+# Tunable upward: "high" | "xhigh" | "max".
+EFFORT = os.environ.get("ANTHROPIC_EFFORT", "high")
 
 LOOKAHEAD_DAYS = 7
 CANDIDATES_PER_DAY = 8
