@@ -19,8 +19,16 @@ PUZZLES_DIR = REPO_ROOT / "puzzles"
 CANDIDATES_DIR = REPO_ROOT / "candidates"
 CONFIG_DIR = REPO_ROOT / "config"
 
-MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-8")
+MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-opus-5-5")
 CASUAL_MODEL = os.environ.get("ANTHROPIC_CASUAL_MODEL", "claude-sonnet-5")
+
+# Opus 5.5 thinks on every call and thinking cannot be turned off, so
+# effort is the only dial for depth/cost. Its default is "medium", one
+# level below the older Opus default — set it explicitly so a version
+# bump never silently changes how hard the model works.
+# Tunable: "low" | "medium" | "high" | "xhigh" | "max".
+EFFORT = os.environ.get("ANTHROPIC_EFFORT", "medium")
+
 LOOKAHEAD_DAYS = 7
 CANDIDATES_PER_DAY = 8
 MAX_POOL_ATTEMPTS = 6
@@ -474,10 +482,14 @@ def generate_haiku(
             f"syllable count."
         )
 
+    # No temperature: Opus 5.5 rejects sampling parameters with a 400.
+    # Variety comes from the angle cue and the per-call seed in the prompt.
+    # max_tokens must cover the model's thinking as well as the three
+    # lines, or the haiku gets cut off mid-poem.
     response = client.messages.create(
         model=MODEL,
-        max_tokens=220,
-        temperature=1.0,
+        max_tokens=4000,
+        output_config={"effort": EFFORT},
         system=SYSTEM_MESSAGE,
         messages=[{"role": "user", "content": "\n".join(parts)}],
     )
@@ -633,8 +645,11 @@ def gate_probe(
         system=OBVIOUS_SYSTEM,
         messages=[{"role": "user", "content": user_msg}],
     )
+    # Opus probe: max_tokens has to leave room for thinking, not just the
+    # small picks JSON, or the response is truncated before the JSON closes.
     trace_response = client.messages.create(
-        model=MODEL, max_tokens=700,
+        model=MODEL, max_tokens=4000,
+        output_config={"effort": EFFORT},
         system=CAREFUL_SYSTEM,
         messages=[{"role": "user", "content": user_msg}],
     )

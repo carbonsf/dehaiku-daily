@@ -135,7 +135,9 @@ python3 scripts/generate.py --day 2026-12-25 --themes "christmas" --seeds "tree,
 
 **Environment variables:**
 - `ANTHROPIC_API_KEY` — required (env var, or `ANTHROPIC_API_KEY=...` in `.env` at the repo root)
-- `ANTHROPIC_MODEL` — override model (default: `claude-opus-4-8`)
+- `ANTHROPIC_MODEL` — override the generator/trace model (default: `claude-opus-5-5`)
+- `ANTHROPIC_CASUAL_MODEL` — override the probe model (default: `claude-sonnet-5`)
+- `ANTHROPIC_EFFORT` — how hard Opus thinks: `low`/`medium`/`high`/`xhigh`/`max` (default: `medium`). Opus 5.5 always thinks, so this is the only dial for quality vs cost and latency.
 
 ### `review.py` — Pick winners
 
