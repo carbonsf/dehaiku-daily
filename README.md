@@ -120,9 +120,9 @@ python3 scripts/generate.py --day 2026-12-25 --themes "christmas" --seeds "tree,
 3. Generate a haiku encoding the 4 answers — theme applied HERE (sets mood/setting only)
 4. Leak check: if any answer word or its stem appears in the haiku, retry with feedback
 5. Truncation guard: verify the haiku isn't cut off
-6. **Line structure** (two layers, both feed specific feedback into the retry — the base prompt is never touched):
-   - *Layer 1 — deterministic, free:* reject commas, any mid-line break in the last line, more than one cut in the poem, or a line ending on a function word (`the`, `of`, `like`…)
-   - *Layer 2 — Sonnet craft probe:* judges line integrity only (no knowledge of the hidden words) — catches noun phrases split across a line break and last lines stitched from fragments
+6. **Line structure** — targets one defect only: a phrase that spills over a line break and stops a word or two into the next line, leaving a bolted-on tail (`silence in the tobacco / sack; we lose, he sighs`). **Punctuation is not the defect.** The poems that work are punctuated sentences (dash after line one, comma after line two, period to land). An earlier version banned commas and capped dashes; it rejected 87% of hand-approved puzzles and flattened the output into three bare noun phrases. Don't widen these rules without re-measuring against `puzzles/`.
+   - *Layer 1 — deterministic, free:* reject a line that runs on with no closing punctuation and either ends on a function word (`the`, `of`, `like`…) or stops within two words of the next line. Rejects ~4% of approved puzzles, all of which have the defect.
+   - *Layer 2 — Sonnet craft probe:* judges line integrity only (no knowledge of the hidden words) — catches split phrases and stitched last lines a regex can't see. Rejects ~4% of approved puzzles.
    - Runs before the gate so a structurally dead haiku never costs an Opus gate call
 7. **Gate** (matches production): two solver probes check the puzzle against the full 12-word pool:
    - *Obvious probe* (sonnet, casual skim) — if it gets 4/4, puzzle is too easy → regenerate

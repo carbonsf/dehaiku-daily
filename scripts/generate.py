@@ -259,19 +259,44 @@ def looks_truncated(lines: list[str]) -> bool:
 
 
 # ── Line structure (Layer 1 — deterministic, free) ────────────
-# The generator's weakest habit is stitching the fourth concept onto the
-# end as a tail after punctuation ("sack; we lose, he sighs"), or splitting
-# a noun phrase across a line break to hit the syllable count
-# ("the tobacco / sack"). These rules catch the cheap cases with no API
-# call; craft_probe() (Layer 2) catches what a regex can't see.
+# One specific defect, and nothing else: a phrase that spills over a line
+# break and stops a word or two into the next line, leaving the rest of
+# that line as a bolted-on tail —
+#     silence in the tobacco / sack; we lose, he sighs
+#     one filtered / organ gone—he roams.
+#
+# Punctuation itself is NOT the defect. The poems that work are punctuated
+# sentences — a dash closing line one, a comma closing line two, a period
+# to land — and an earlier version of this check that banned commas and
+# capped dashes rejected 87% of the puzzles that had been approved by hand,
+# flattening the output into three unpunctuated noun phrases. Measured
+# against those same approved puzzles, the two rules below reject ~5% and
+# still catch every example of the defect. Keep it this narrow;
+# craft_probe() (Layer 2) covers what a regex can't see.
 
+# Words that can only end a line if the phrase continues on the next one.
+# Verb particles (in, on, by, up, through…) are deliberately absent:
+# "the tide comes in" and "a ghost drifts by" are complete lines.
 LINE_END_FUNCTION_WORDS = {
-    "the", "a", "an", "of", "in", "to", "like", "then", "and", "with",
-    "or", "but", "for", "at", "on", "by", "from", "into", "as", "nor",
-    "so", "than", "through", "my", "their", "our", "your",
+    "the", "a", "an", "of", "to", "and", "or", "nor", "with", "from",
+    "into", "than", "like", "as", "for", "at", "my", "your", "their",
+    "our", "its",
 }
 
-CUT_MARKS = re.compile(r"—|–|--|;|:")
+_LINE_END_PUNCT = re.compile(r"(—|–|--|[,;:.!?])\s*$")
+_BREAK = re.compile(r"—|–|--|[,;:]|[.!?](?=\s*\S)")
+_TRAILING = ".,;:—–!?- "
+RUNOVER_MAX_WORDS = 2
+
+
+def _words_before_first_break(line: str) -> int | None:
+    """Words in the line before its first internal break, or None if the
+    line has no internal break (trailing punctuation doesn't count)."""
+    core = line.strip().rstrip(_TRAILING)
+    m = _BREAK.search(core)
+    if not m:
+        return None
+    return len(re.findall(r"[A-Za-z']+", core[: m.start()]))
 
 
 class StructureError(ValueError):
@@ -280,25 +305,22 @@ class StructureError(ValueError):
 
 def check_structure(lines: list[str]) -> str | None:
     """Return a reason the line structure is broken, or None if clean."""
-    if any("," in line for line in lines):
-        return "contains a comma (commas are forbidden)"
-    if CUT_MARKS.search(lines[-1]):
-        return (
-            "the last line has a mid-line break — it must be one "
-            "unbroken phrase"
-        )
-    cuts = sum(len(CUT_MARKS.findall(line)) for line in lines)
-    if cuts > 1:
-        return (
-            f"has {cuts} cuts (dashes/semicolons/colons) — a haiku has "
-            f"at most one turn"
-        )
-    for i, line in enumerate(lines[:-1], 1):
-        words = re.findall(r"[a-zA-Z']+", line)
+    for i in range(len(lines) - 1):
+        if _LINE_END_PUNCT.search(lines[i]):
+            continue  # the line closes cleanly; whatever follows starts fresh
+        words = re.findall(r"[A-Za-z']+", lines[i])
         if words and words[-1].lower() in LINE_END_FUNCTION_WORDS:
             return (
-                f'line {i} ends on "{words[-1]}" — a phrase is split '
-                f"across the line break"
+                f'line {i + 1} ends on "{words[-1]}", so its phrase is cut '
+                f"in half by the line break"
+            )
+        spill = _words_before_first_break(lines[i + 1])
+        if spill is not None and 1 <= spill <= RUNOVER_MAX_WORDS:
+            stub = " ".join(re.findall(r"[A-Za-z'-]+", lines[i + 1])[:spill])
+            return (
+                f"line {i + 1} spills over the break and stops at "
+                f'"{stub}" in line {i + 2}, leaving the rest of that line '
+                f"as a tacked-on tail"
             )
     return None
 
@@ -434,9 +456,11 @@ def generate_haiku(
         "separate clues."
     )
     parts.append(
-        "• Use NO commas. Never tack a fourth clue onto the end of a line "
-        'as a trailing tail (e.g. "...the sea exhales, a coin sinks") — '
-        "weave every word into the single image, not a list."
+        "• Let each line be one whole phrase and punctuate it like a "
+        "sentence: a dash or comma belongs at the END of a line, where "
+        "the poem turns or carries on. Don't let a phrase spill over a "
+        "line break and stop a word into the next line, and don't bolt "
+        "a leftover clue onto the last line as a tail."
     )
     parts.append(
         "• Make the player infer each word from the scene; avoid "
@@ -476,12 +500,10 @@ def generate_haiku(
     if structure_feedback:
         parts.append("")
         parts.append(
-            f"PREVIOUS ATTEMPT had broken line structure: "
-            f"{structure_feedback}. Each line must read as one complete "
-            f"phrase. The last line must land as a single unbroken image "
-            f"— no commas, no tail stitched on after a dash or semicolon. "
-            f"Never split a noun phrase across a line break to hit the "
-            f"syllable count."
+            f"PREVIOUS ATTEMPT broke a line badly: {structure_feedback}. "
+            f"Keep the voice, the wit and the punctuation — only make "
+            f"each phrase end where its line ends, so the last line lands "
+            f"as one image."
         )
 
     # No temperature: Opus 5.5 rejects sampling parameters with a 400.
