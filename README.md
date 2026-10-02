@@ -124,6 +124,7 @@ python3 scripts/generate.py --day 2026-12-25 --themes "christmas" --seeds "tree,
    - *Layer 1 — deterministic, free:* reject a line that runs on with no closing punctuation and either ends on a function word (`the`, `of`, `like`…) or stops within two words of the next line. Rejects ~4% of approved puzzles, all of which have the defect.
    - *Layer 2 — Sonnet craft probe:* judges line integrity only (no knowledge of the hidden words) — catches split phrases and stitched last lines a regex can't see. Rejects ~4% of approved puzzles.
    - Runs before the gate so a structurally dead haiku never costs an Opus gate call
+   - *Post-processing:* once a haiku clears both layers, any comma that closes a line is removed from the published text — the line break is already the pause. The model may still write them (they give the poem its grammar); mid-line commas, dashes, periods and question marks are kept. This must run after the checks, which read line-end punctuation.
 7. **Gate** (matches production): two solver probes check the puzzle against the full 12-word pool:
    - *Obvious probe* (sonnet, casual skim) — if it gets 4/4, puzzle is too easy → regenerate
    - *Trace probe* (opus, careful solve) — any answer it can't find is unfair → regenerate

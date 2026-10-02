@@ -325,6 +325,24 @@ def check_structure(lines: list[str]) -> str | None:
     return None
 
 
+def strip_line_end_commas(haiku: str) -> str:
+    """Remove a comma that closes a line. Post-processing only.
+
+    The model is allowed — encouraged — to write a punctuated sentence,
+    because that is what gives the poem its grammar and its turn. But a
+    haiku on the page doesn't end its lines with commas: the line break
+    is already the pause. So the comma is dropped from the published text.
+
+    Only line-END commas go. Mid-line commas stay (removing those makes a
+    run-on: "the sea exhales a coin sinks"), and so do dashes, periods and
+    question marks, which carry the cut and the landing.
+
+    Must run AFTER check_structure() and craft_probe(): both read line-end
+    punctuation to tell a cleanly closed line from one that spills over.
+    """
+    return "\n".join(re.sub(r"\s*,+\s*$", "", line) for line in haiku.split("\n"))
+
+
 def leaked_words(haiku: str, words: list[str]) -> list[str]:
     """Return answer words whose text leaked into the haiku.
 
@@ -794,7 +812,8 @@ def generate_puzzle(
                         )
                         print(f"      [{candidate.replace(chr(10), ' / ')}]")
                         continue
-                    haiku = candidate
+                    # Passed every line check — now tidy for the page.
+                    haiku = strip_line_end_commas(candidate)
                     break
                 except StructureError as se:
                     struct_fb = str(se)
