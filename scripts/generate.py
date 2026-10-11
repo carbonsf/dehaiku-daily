@@ -258,26 +258,114 @@ def looks_truncated(lines: list[str]) -> bool:
     return False
 
 
+# ── Generation versions ──────────────────────────────────────
+# Two recipes have shipped, and they differ in exactly four places: the
+# deterministic line-structure check, the prompt bullet about line shape,
+# the retry feedback when that check fails, and whether line-end commas
+# are stripped from the finished poem. Everything else — model, effort,
+# word pool, leak check, syllables, craft probe, gate — is shared.
+#
+#   CHOPPED   the recipe from 2026-09-06 to 2026-10-02 (commit eb38079).
+#             Bans commas outright, allows one cut, forbids any break in
+#             the last line. Produces bare, terse, imagistic lines.
+#             Rejects ~87% of the hand-approved puzzles from before it
+#             shipped, so it retries often.
+#   POLISHED  the recipe from 2026-10-02 on (commits abc73e3 + 8a42b06).
+#             Only rejects a phrase that spills over a line break and
+#             stops a word or two into the next line. Lets the model
+#             punctuate a full sentence, then strips line-end commas from
+#             the page. Rejects ~4% of hand-approved puzzles.
+#   HYBRID    CHOPPED's prompt (the "no commas" nudge is what shapes the
+#             terse voice, and a prompt is free) on top of POLISHED's
+#             tolerant check, gentle feedback and comma strip (rejection
+#             is what costs retries and flattens the output).
+#
+# The table below is the whole definition of each version. Each row names
+# which implementation of the four parts to use; the implementations
+# themselves are kept verbatim from the commits above.
+
+VERSIONS = ("POLISHED", "CHOPPED", "HYBRID")
+VERSION = "POLISHED"  # set once from --version in main(); see set_version()
+
+VERSION_SPEC = {
+    #               structure check   prompt bullet   retry feedback   strip
+    "CHOPPED":  dict(check="chopped",  bullet="chopped",  feedback="chopped",  strip=False),
+    "POLISHED": dict(check="polished", bullet="polished", feedback="polished", strip=True),
+    "HYBRID":   dict(check="polished", bullet="chopped",  feedback="hybrid",   strip=True),
+}
+
+
+def set_version(name: str) -> None:
+    global VERSION
+    name = name.strip().upper()
+    if name not in VERSIONS:
+        raise ValueError(f"unknown version {name!r}; choose from {', '.join(VERSIONS)}")
+    VERSION = name
+
+
+def _spec() -> dict:
+    return VERSION_SPEC[VERSION]
+
+
 # ── Line structure (Layer 1 — deterministic, free) ────────────
+# craft_probe() (Layer 2) covers what a regex can't see, in every version.
+
+
+class StructureError(ValueError):
+    """Haiku line structure is fragmented. The message is retry feedback."""
+
+
+# --- CHOPPED check — verbatim from eb38079 ---------------------------------
+# Bans commas, allows at most one cut, forbids any break in the last line,
+# and rejects a line ending on a function word (including verb particles).
+
+_FUNCTION_WORDS_CHOPPED = {
+    "the", "a", "an", "of", "in", "to", "like", "then", "and", "with",
+    "or", "but", "for", "at", "on", "by", "from", "into", "as", "nor",
+    "so", "than", "through", "my", "their", "our", "your",
+}
+
+_CUT_MARKS_CHOPPED = re.compile(r"—|–|--|;|:")
+
+
+def _check_structure_chopped(lines: list[str]) -> str | None:
+    if any("," in line for line in lines):
+        return "contains a comma (commas are forbidden)"
+    if _CUT_MARKS_CHOPPED.search(lines[-1]):
+        return (
+            "the last line has a mid-line break — it must be one "
+            "unbroken phrase"
+        )
+    cuts = sum(len(_CUT_MARKS_CHOPPED.findall(line)) for line in lines)
+    if cuts > 1:
+        return (
+            f"has {cuts} cuts (dashes/semicolons/colons) — a haiku has "
+            f"at most one turn"
+        )
+    for i, line in enumerate(lines[:-1], 1):
+        words = re.findall(r"[a-zA-Z']+", line)
+        if words and words[-1].lower() in _FUNCTION_WORDS_CHOPPED:
+            return (
+                f'line {i} ends on "{words[-1]}" — a phrase is split '
+                f"across the line break"
+            )
+    return None
+
+
+# --- POLISHED check — verbatim from abc73e3 --------------------------------
 # One specific defect, and nothing else: a phrase that spills over a line
 # break and stops a word or two into the next line, leaving the rest of
 # that line as a bolted-on tail —
 #     silence in the tobacco / sack; we lose, he sighs
 #     one filtered / organ gone—he roams.
-#
-# Punctuation itself is NOT the defect. The poems that work are punctuated
-# sentences — a dash closing line one, a comma closing line two, a period
-# to land — and an earlier version of this check that banned commas and
-# capped dashes rejected 87% of the puzzles that had been approved by hand,
-# flattening the output into three unpunctuated noun phrases. Measured
-# against those same approved puzzles, the two rules below reject ~5% and
-# still catch every example of the defect. Keep it this narrow;
-# craft_probe() (Layer 2) covers what a regex can't see.
+# Punctuation itself is NOT the defect: the poems that work are punctuated
+# sentences. Measured against the hand-approved puzzles, this rejects ~4%
+# and still catches every example of the defect. Keep it this narrow.
 
 # Words that can only end a line if the phrase continues on the next one.
 # Verb particles (in, on, by, up, through…) are deliberately absent:
 # "the tide comes in" and "a ghost drifts by" are complete lines.
-LINE_END_FUNCTION_WORDS = {
+_FUNCTION_WORDS_POLISHED = {
     "the", "a", "an", "of", "to", "and", "or", "nor", "with", "from",
     "into", "than", "like", "as", "for", "at", "my", "your", "their",
     "our", "its",
@@ -299,17 +387,12 @@ def _words_before_first_break(line: str) -> int | None:
     return len(re.findall(r"[A-Za-z']+", core[: m.start()]))
 
 
-class StructureError(ValueError):
-    """Haiku line structure is fragmented. The message is retry feedback."""
-
-
-def check_structure(lines: list[str]) -> str | None:
-    """Return a reason the line structure is broken, or None if clean."""
+def _check_structure_polished(lines: list[str]) -> str | None:
     for i in range(len(lines) - 1):
         if _LINE_END_PUNCT.search(lines[i]):
             continue  # the line closes cleanly; whatever follows starts fresh
         words = re.findall(r"[A-Za-z']+", lines[i])
-        if words and words[-1].lower() in LINE_END_FUNCTION_WORDS:
+        if words and words[-1].lower() in _FUNCTION_WORDS_POLISHED:
             return (
                 f'line {i + 1} ends on "{words[-1]}", so its phrase is cut '
                 f"in half by the line break"
@@ -323,6 +406,70 @@ def check_structure(lines: list[str]) -> str | None:
                 f"as a tacked-on tail"
             )
     return None
+
+
+_CHECKS = {"chopped": _check_structure_chopped, "polished": _check_structure_polished}
+
+
+def check_structure(lines: list[str]) -> str | None:
+    """Return a reason the line structure is broken, or None if clean.
+    Which rules apply depends on the active VERSION."""
+    return _CHECKS[_spec()["check"]](lines)
+
+
+# --- Prompt bullet and retry feedback, per version --------------------------
+
+_BULLET_CHOPPED = (
+    "• Use NO commas. Never tack a fourth clue onto the end of a line "
+    'as a trailing tail (e.g. "...the sea exhales, a coin sinks") — '
+    "weave every word into the single image, not a list."
+)
+_BULLET_POLISHED = (
+    "• Let each line be one whole phrase and punctuate it like a "
+    "sentence: a dash or comma belongs at the END of a line, where "
+    "the poem turns or carries on. Don't let a phrase spill over a "
+    "line break and stop a word into the next line, and don't bolt "
+    "a leftover clue onto the last line as a tail."
+)
+_BULLETS = {"chopped": _BULLET_CHOPPED, "polished": _BULLET_POLISHED}
+
+
+def structure_bullet() -> str:
+    return _BULLETS[_spec()["bullet"]]
+
+
+def structure_feedback_text(issue: str) -> str:
+    kind = _spec()["feedback"]
+    if kind == "chopped":
+        return (
+            f"PREVIOUS ATTEMPT had broken line structure: "
+            f"{issue}. Each line must read as one complete "
+            f"phrase. The last line must land as a single unbroken image "
+            f"— no commas, no tail stitched on after a dash or semicolon. "
+            f"Never split a noun phrase across a line break to hit the "
+            f"syllable count."
+        )
+    if kind == "polished":
+        return (
+            f"PREVIOUS ATTEMPT broke a line badly: {issue}. "
+            f"Keep the voice, the wit and the punctuation — only make "
+            f"each phrase end where its line ends, so the last line lands "
+            f"as one image."
+        )
+    # hybrid: POLISHED's feedback without "and the punctuation", which
+    # would contradict the CHOPPED bullet's "Use NO commas" in the same
+    # prompt.
+    return (
+        f"PREVIOUS ATTEMPT broke a line badly: {issue}. "
+        f"Keep the voice and the wit — only make each phrase end where "
+        f"its line ends, so the last line lands as one image."
+    )
+
+
+def finish_haiku(haiku: str) -> str:
+    """Final text for the page. POLISHED and HYBRID strip line-end commas;
+    CHOPPED publishes the model's text verbatim."""
+    return strip_line_end_commas(haiku) if _spec()["strip"] else haiku
 
 
 def strip_line_end_commas(haiku: str) -> str:
@@ -473,13 +620,7 @@ def generate_haiku(
         "with all four words implied inside it; do not write four "
         "separate clues."
     )
-    parts.append(
-        "• Let each line be one whole phrase and punctuate it like a "
-        "sentence: a dash or comma belongs at the END of a line, where "
-        "the poem turns or carries on. Don't let a phrase spill over a "
-        "line break and stop a word into the next line, and don't bolt "
-        "a leftover clue onto the last line as a tail."
-    )
+    parts.append(structure_bullet())
     parts.append(
         "• Make the player infer each word from the scene; avoid "
         "one-word synonym giveaways."
@@ -517,12 +658,7 @@ def generate_haiku(
     # Line-structure feedback from check_structure() or craft_probe()
     if structure_feedback:
         parts.append("")
-        parts.append(
-            f"PREVIOUS ATTEMPT broke a line badly: {structure_feedback}. "
-            f"Keep the voice, the wit and the punctuation — only make "
-            f"each phrase end where its line ends, so the last line lands "
-            f"as one image."
-        )
+        parts.append(structure_feedback_text(structure_feedback))
 
     # No temperature: Opus 5.5 rejects sampling parameters with a 400.
     # Variety comes from the angle cue and the per-call seed in the prompt.
@@ -812,8 +948,9 @@ def generate_puzzle(
                         )
                         print(f"      [{candidate.replace(chr(10), ' / ')}]")
                         continue
-                    # Passed every line check — now tidy for the page.
-                    haiku = strip_line_end_commas(candidate)
+                    # Passed every line check — now tidy for the page
+                    # (a no-op under CHOPPED).
+                    haiku = finish_haiku(candidate)
                     break
                 except StructureError as se:
                     struct_fb = str(se)
@@ -856,6 +993,7 @@ def generate_puzzle(
                 "words": answer_words,
                 "decoys": decoy_words,
                 "theme": theme,
+                "version": VERSION,
             }
 
             if not too_obvious:
@@ -908,6 +1046,18 @@ def parse_args():
         "answers or decoys — the draw is random.",
     )
     p.add_argument(
+        "--version",
+        type=str.upper,
+        choices=VERSIONS,
+        default="POLISHED",
+        metavar="|".join(VERSIONS),
+        help="Generation recipe. POLISHED: punctuated sentence, narrow "
+             "structure check, line-end commas stripped (default). "
+             "CHOPPED: the earlier no-commas recipe, verbatim. HYBRID: "
+             "CHOPPED's prompt on POLISHED's check and comma strip. "
+             "Case-insensitive.",
+    )
+    p.add_argument(
         "--force",
         action="store_true",
         help="Regenerate even if candidates already exist for that day",
@@ -917,6 +1067,8 @@ def parse_args():
 
 def main() -> None:
     args = parse_args()
+    set_version(args.version)
+    print(f"Version: {VERSION}")
     api_key = load_api_key()
     if not api_key:
         print(

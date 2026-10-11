@@ -104,6 +104,9 @@ python3 scripts/generate.py --themes "winter wonderland,cozy cabin,holiday feast
 # Specific start date (single day)
 python3 scripts/generate.py --day 2026-06-15
 
+# Pick the generation recipe (see "Versions" below; case-insensitive, default POLISHED)
+python3 scripts/generate.py --version hybrid
+
 # Seed words mixed into the 12-word pool (may land as answers or decoys)
 python3 scripts/generate.py --seeds "tree,gift,snow"
 
@@ -188,6 +191,21 @@ python3 scripts/review.py
 # 3. Click "Commit & Push" in the UI when done
 #    (or manually: git add puzzles/ config/ && git commit && git push)
 ```
+
+## Versions
+
+`--version` (CLI) or the dropdown in the review UI's regenerate bar picks one of three recipes. They differ in exactly four places; the model, effort, word pool, leak check, syllables, craft probe and gate are shared. Each candidate records which recipe made it (`"version"` in the JSON, shown as a badge on its card), so you can A/B them day by day.
+
+| | CHOPPED | POLISHED (default) | HYBRID |
+|---|---|---|---|
+| Prompt bullet | "Use NO commas, no tacked-on tail" | "punctuate like a sentence; breaks at line ends" | CHOPPED's |
+| Structure check | bans commas, max one cut, no break in last line, function-word line ends | only a phrase that spills over a line break and stops a word or two into the next line | POLISHED's |
+| Retry feedback | restates the prohibitions | "keep the voice, wit and punctuation" | POLISHED's, minus "punctuation" |
+| Line-end commas | published as written | stripped from the page | stripped |
+| Rejects of hand-approved puzzles | ~87% | ~4% | ~4% |
+| Feel | bare, terse, imagistic; retries often | punctuated sentence with a turn; witty landings | CHOPPED's voice at the prompt, POLISHED's economy at the gate |
+
+CHOPPED and POLISHED are the recipes exactly as they shipped (commits `eb38079` and `8a42b06`); the implementations are kept verbatim in `generate.py` and selected by a table (`VERSION_SPEC`), which is also where you'd compose a new mix.
 
 ## Theme rotation
 

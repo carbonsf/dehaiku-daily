@@ -184,7 +184,7 @@ JOB = {
 }
 
 
-def start_regeneration(day_str, seeds_csv="", theme=""):
+def start_regeneration(day_str, seeds_csv="", theme="", version=""):
     """Kick off generate.py for one day in the background."""
     with JOB_LOCK:
         if JOB["running"]:
@@ -216,6 +216,8 @@ def start_regeneration(day_str, seeds_csv="", theme=""):
         cmd.extend(["--seeds", seeds_csv.strip()])
     if theme.strip():
         cmd.extend(["--themes", theme.strip()])
+    if version.strip():
+        cmd.extend(["--version", version.strip()])
 
     proc = subprocess.Popen(
         cmd, cwd=REPO_ROOT,
@@ -339,7 +341,8 @@ class ReviewHandler(http.server.BaseHTTPRequestHandler):
             self._json(unapprove_day(body["date"]))
         elif self.path == "/api/regenerate":
             self._json(start_regeneration(
-                body["date"], body.get("seeds", ""), body.get("theme", "")
+                body["date"], body.get("seeds", ""), body.get("theme", ""),
+                body.get("version", ""),
             ))
         elif self.path == "/api/regenerate/cancel":
             self._json(cancel_regeneration())
@@ -453,6 +456,9 @@ header h1{font-size:16px;font-weight:600;letter-spacing:.02em}
 .regen{display:flex;align-items:center;gap:8px;justify-content:center;padding:12px 24px;flex-wrap:wrap}
 .regen input{padding:6px 12px;border:1px solid var(--border);border-radius:6px;font-size:13px;width:260px;font-family:inherit}
 .regen input:focus{outline:none;border-color:var(--accent)}
+.regen select{padding:6px 10px;border:1px solid var(--border);border-radius:6px;font-size:13px;font-family:inherit;background:var(--surface);color:var(--text)}
+.regen select:focus{outline:none;border-color:var(--accent)}
+.ver{margin-left:8px;padding:1px 7px;border-radius:9px;font-size:10px;font-weight:700;letter-spacing:.05em;background:var(--dec-bg);color:var(--dec-text)}
 .regen-btn{padding:6px 16px;background:#f97316;color:#fff;border:none;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;transition:background .15s}
 .regen-btn:hover{background:#ea580c}
 .regen-btn:disabled{opacity:.5;cursor:not-allowed}
@@ -510,8 +516,13 @@ header h1{font-size:16px;font-weight:600;letter-spacing:.02em}
 <div class="regen" id="regen" style="display:none">
   <input type="text" id="themeInput" placeholder="Optional theme override (e.g. winter wonderland)">
   <input type="text" id="seedInput" placeholder="Optional seed words (e.g. tree, gift, snow)">
+  <select id="versionInput" title="Generation recipe">
+    <option value="POLISHED">POLISHED</option>
+    <option value="CHOPPED">CHOPPED</option>
+    <option value="HYBRID">HYBRID</option>
+  </select>
   <button class="regen-btn" id="regenBtn" onclick="regenerate()">Regenerate</button>
-  <div class="hint">Re-rolls all 8 candidates. Theme overrides the rotation; seed words get mixed into the 12-word pool.</div>
+  <div class="hint">Re-rolls all 8 candidates. Theme overrides the rotation; seed words get mixed into the 12-word pool. Version picks the recipe (see README); each card shows which one made it.</div>
 </div>
 <div class="gen" id="gen" hidden>
   <div class="gen-top">
@@ -591,7 +602,7 @@ async function selectDay(day) {
     var puzzle = await api('/api/puzzle/' + day);
     if (puzzle && !puzzle.error) {
       hdr.innerHTML = '<h2>' + longDate(day) + '</h2>'
-        + '<div class="meta">Approved · Theme: ' + esc(puzzle.theme || '—') + '</div>';
+        + '<div class="meta">Approved · Theme: ' + esc(puzzle.theme || '—') + (puzzle.version ? ' · ' + esc(puzzle.version) : '') + '</div>';
       grid.innerHTML = '<div class="card approved-card">'
         + '<div class="card-num">Approved Puzzle</div>'
         + '<div class="haiku">' + esc(puzzle.haiku) + '</div>'
@@ -625,7 +636,7 @@ async function selectDay(day) {
   grid.innerHTML = candidates.map(function(c) {
     const n = c._num;
     return '<div class="card">'
-      + '<div class="card-num">Option ' + n + '</div>'
+      + '<div class="card-num">Option ' + n + (c.version ? '<span class="ver">' + esc(c.version) + '</span>' : '') + '</div>'
       + '<div class="haiku">' + esc(c.haiku) + '</div>'
       + '<div class="sec-label">Answers (' + c.words.length + ')</div>'
       + '<div class="pills">' + c.words.map(function(w) { return '<span class="pill ans">' + esc(w) + '</span>'; }).join('') + '</div>'
@@ -668,7 +679,8 @@ async function regenerate() {
   if (!day) return;
   const seeds = document.getElementById('seedInput').value.trim();
   const theme = document.getElementById('themeInput').value.trim();
-  const parts = [];
+  const version = document.getElementById('versionInput').value;
+  const parts = ['version ' + version];
   if (theme) parts.push('theme "' + theme + '"');
   if (seeds) parts.push('seeds "' + seeds + '"');
   const label = parts.length ? ' with ' + parts.join(' and ') : '';
@@ -676,7 +688,7 @@ async function regenerate() {
   const res = await api('/api/regenerate', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({date: day, seeds: seeds, theme: theme})
+    body: JSON.stringify({date: day, seeds: seeds, theme: theme, version: version})
   });
   if (!res.ok) { alert(res.message); return; }
   beginGenPanel(day, 0);
