@@ -9,6 +9,8 @@ import os
 import random
 import re
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -72,6 +74,33 @@ def load_api_key() -> str | None:
                 if val:
                     return val
     return None
+
+
+def api_key_source() -> str:
+    """Where load_api_key() got its key from, for error messages."""
+    if os.environ.get("ANTHROPIC_API_KEY", "").strip():
+        return "the ANTHROPIC_API_KEY environment variable"
+    if (REPO_ROOT / ".env").exists():
+        return "the .env file at the repo root"
+    return "nowhere"
+
+
+def check_api_key(client: anthropic.Anthropic) -> None:
+    """One free call so a bad key fails here, once, with its source named —
+    instead of once per parallel worker with no hint which copy is stale."""
+    try:
+        client.messages.count_tokens(
+            model=CASUAL_MODEL,
+            messages=[{"role": "user", "content": "ping"}],
+        )
+    except anthropic.AuthenticationError:
+        print(
+            f"Error: the API key from {api_key_source()} was rejected (401).\n"
+            f"  A key in the environment (e.g. exported in ~/.zshrc) wins over "
+            f".env, so if you updated .env, check that no stale export is "
+            f"shadowing it. New keys: https://console.anthropic.com/settings/keys"
+        )
+        sys.exit(1)
 
 
 # ── Prompt (v8 poem-first — matches production web/lib/prompts.ts) ──
@@ -893,6 +922,7 @@ def generate_puzzle(
     max_size: int,
     angle_cue: str | None = None,
     seed_words: list[str] | None = None,
+    log=print,
 ) -> tuple[dict, list[str]]:
     # Track the best FAIR candidate across all attempts.
     # Zero-trace (unfindable word) = hard fail, never ship.
@@ -903,14 +933,14 @@ def generate_puzzle(
     best_obvious = True  # True = obvious, False = not; prefer False
 
     for pool_attempt in range(1, MAX_POOL_ATTEMPTS + 1):
-        print(f"  Word pool attempt {pool_attempt}/{MAX_POOL_ATTEMPTS}...")
+        log(f"  Word pool attempt {pool_attempt}/{MAX_POOL_ATTEMPTS}...")
         pool = generate_word_pool(dictionary, banned_words, seed_words)
-        print(f"  Pool (12): {pool}")
+        log(f"  Pool (12): {pool}")
 
         answer_words = pool[:4]
         decoy_words = pool[4:]
-        print(f"  Answers: {answer_words}")
-        print(f"  Decoys:  {decoy_words}")
+        log(f"  Answers: {answer_words}")
+        log(f"  Decoys:  {decoy_words}")
 
         g_feedback: str | None = None
 
@@ -933,7 +963,7 @@ def generate_puzzle(
                     leaks = leaked_words(candidate, answer_words)
                     if leaks:
                         leak_fb = leaks
-                        print(
+                        log(
                             f"    Haiku leaked {leaks} "
                             f"(try {h_try}/{HAIKU_RETRIES})"
                         )
@@ -942,11 +972,11 @@ def generate_puzzle(
                     craft_ok, craft_issue = craft_probe(client, candidate)
                     if not craft_ok:
                         struct_fb = craft_issue
-                        print(
+                        log(
                             f"    Craft probe failed "
                             f"(try {h_try}/{HAIKU_RETRIES}): {craft_issue}"
                         )
-                        print(f"      [{candidate.replace(chr(10), ' / ')}]")
+                        log(f"      [{candidate.replace(chr(10), ' / ')}]")
                         continue
                     # Passed every line check — now tidy for the page
                     # (a no-op under CHOPPED).
@@ -954,29 +984,29 @@ def generate_puzzle(
                     break
                 except StructureError as se:
                     struct_fb = str(se)
-                    print(
+                    log(
                         f"    Structure rejected "
                         f"(try {h_try}/{HAIKU_RETRIES}): {se}"
                     )
                 except ValueError as ve:
-                    print(
+                    log(
                         f"    Haiku rejected "
                         f"(try {h_try}/{HAIKU_RETRIES}): {ve}"
                     )
 
             if haiku is None:
-                print(f"    Could not produce a clean haiku — new pool")
+                log(f"    Could not produce a clean haiku — new pool")
                 break
 
-            print(f"  Haiku:\n    " + haiku.replace("\n", "\n    "))
+            log(f"  Haiku:\n    " + haiku.replace("\n", "\n    "))
 
-            print(f"    Gate check ({g_try}/{GATE_BUDGET})...")
+            log(f"    Gate check ({g_try}/{GATE_BUDGET})...")
             passed, too_obvious, zero_trace = gate_probe(
                 client, haiku, theme, pool, answer_words,
             )
 
             if zero_trace:
-                print(
+                log(
                     f"    Gate failed — zero-trace: "
                     f"{', '.join(zero_trace)}"
                 )
@@ -997,23 +1027,23 @@ def generate_puzzle(
             }
 
             if not too_obvious:
-                print(f"    Gate passed ✓")
+                log(f"    Gate passed ✓")
                 return puzzle, new_banned
 
             # Fair but obvious — stash if it's our first fair candidate
-            print(f"    Gate: fair but too obvious — continuing")
+            log(f"    Gate: fair but too obvious — continuing")
             if best is None or best_obvious:
                 best = puzzle
                 best_banned = new_banned
                 best_obvious = too_obvious
             g_feedback = gate_feedback_text(too_obvious, zero_trace)
         else:
-            print(f"    Gate budget exhausted — drawing new words")
+            log(f"    Gate budget exhausted — drawing new words")
 
     # Exhausted all pools. Ship the best fair-but-obvious if we have one.
     if best is not None:
         label = "obvious" if best_obvious else "clean"
-        print(f"    All pools exhausted — using best fair attempt ({label})")
+        log(f"    All pools exhausted — using best fair attempt ({label})")
         return best, best_banned
 
     raise RuntimeError(
@@ -1023,6 +1053,126 @@ def generate_puzzle(
 
 
 # ── CLI ──────────────────────────────────────────────────────
+
+
+# ── One day, N candidates in parallel ─────────────────────────
+# The 8 candidates for a day are independent except for the first-word
+# ban: each one is told not to open with the words its siblings opened
+# with, so the day doesn't ship eight haikus that all start "Dusk…".
+# Sequentially that was a chain (candidate 2 learned candidate 1's first
+# word). In parallel nobody can know a sibling's first word in advance,
+# so instead: run the whole batch, look at the first words, and
+# regenerate only the colliders in a second parallel round with those
+# words banned. Up to MAX_BAN_ROUNDS rounds; the usual case is one.
+#
+# Every line a worker prints is prefixed "[n] " so the review UI can
+# attribute interleaved output to the right candidate.
+
+MAX_BAN_ROUNDS = 3
+_PRINT_LOCK = threading.Lock()
+
+
+def _first_word(haiku: str) -> str:
+    first = haiku.split("\n")[0].split()
+    return re.sub(r"[^a-z]", "", first[0].lower()) if first else ""
+
+
+def _candidate_logger(n: int):
+    tag = f"[{n}]"
+
+    def log(msg: str = "") -> None:
+        with _PRINT_LOCK:
+            for line in str(msg).split("\n"):
+                print(f"{tag} {line}", flush=True)
+
+    return log
+
+
+def generate_day(
+    client: anthropic.Anthropic,
+    dictionary: list[str],
+    d: date,
+    theme: str,
+    banned_words: list[str],
+    max_size: int,
+    angles: list[str],
+    seed_words: list[str] | None,
+    day_dir: Path,
+    workers: int = 8,
+) -> dict[int, dict]:
+    """Generate CANDIDATES_PER_DAY puzzles for one day, `workers` at a
+    time, and write each to day_dir/<n>.json as it lands. Returns
+    {n: puzzle}; a slot is missing only if that candidate raised."""
+    results: dict[int, dict] = {}
+    pending = list(range(1, CANDIDATES_PER_DAY + 1))
+    banned = list(banned_words)
+
+    def work(n: int):
+        log = _candidate_logger(n)
+        angle = angles[(n - 1) % len(angles)]
+        log(f"Candidate {n}/{CANDIDATES_PER_DAY} ({angle[:45]}…):")
+        puzzle, _ = generate_puzzle(
+            client, dictionary, d, theme, banned, max_size,
+            angle_cue=angle, seed_words=seed_words, log=log,
+        )
+        with open(day_dir / f"{n}.json", "w") as f:
+            json.dump(puzzle, f, indent=2)
+            f.write("\n")
+        log(f"  Saved → candidates/{d.isoformat()}/{n}.json")
+        return n, puzzle
+
+    for rnd in range(1, MAX_BAN_ROUNDS + 1):
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+            futures = [ex.submit(work, n) for n in pending]
+            for fut in as_completed(futures):
+                try:
+                    n, puzzle = fut.result()
+                    results[n] = puzzle
+                except Exception as e:  # keep the rest of the day alive
+                    with _PRINT_LOCK:
+                        print(
+                            f"  !! a candidate failed: "
+                            f"{type(e).__name__}: {e}",
+                            flush=True,
+                        )
+        if rnd == MAX_BAN_ROUNDS:
+            break
+
+        # First-word collisions: keep the lowest-numbered candidate for
+        # each opening word, regenerate the rest with those words banned.
+        keeper: dict[str, int] = {}
+        colliders: list[int] = []
+        for n in sorted(results):
+            fw = _first_word(results[n]["haiku"])
+            if fw and fw in keeper:
+                colliders.append(n)
+            else:
+                keeper[fw] = n
+        if not colliders:
+            break
+        banned = (list(banned_words) + list(keeper))[-max_size:]
+        for n in colliders:
+            fw = _first_word(results[n]["haiku"])
+            with _PRINT_LOCK:
+                print(
+                    f'[{n}]   First word "{fw}" collides with candidate '
+                    f"{keeper[fw]} — regenerating with it banned",
+                    flush=True,
+                )
+            del results[n]
+        pending = colliders
+
+    dups = {}
+    for n, p in results.items():
+        dups.setdefault(_first_word(p["haiku"]), []).append(n)
+    for fw, ns in dups.items():
+        if fw and len(ns) > 1:
+            print(
+                f'  note: candidates {ns} all open with "{fw}" after '
+                f"{MAX_BAN_ROUNDS} rounds",
+                flush=True,
+            )
+    return results
 
 
 def parse_args():
@@ -1058,6 +1208,15 @@ def parse_args():
              "Case-insensitive.",
     )
     p.add_argument(
+        "--workers",
+        type=int,
+        default=8,
+        metavar="N",
+        help="How many of a day's candidates to generate at once "
+             "(default 8 — the whole day in one round). Use 1 for the "
+             "old one-at-a-time behaviour, e.g. when rate-limited.",
+    )
+    p.add_argument(
         "--force",
         action="store_true",
         help="Regenerate even if candidates already exist for that day",
@@ -1076,7 +1235,10 @@ def main() -> None:
             "put ANTHROPIC_API_KEY=sk-ant-... in a .env file at the repo root."
         )
         sys.exit(1)
-    client = anthropic.Anthropic(api_key=api_key)
+    # Eight workers hit the API at once, so give the SDK's built-in
+    # backoff more room to absorb a burst of 429s before we see one.
+    client = anthropic.Anthropic(api_key=api_key, max_retries=5)
+    check_api_key(client)
     dictionary = load_dictionary()
     rotation_themes = load_themes()
     banned_words, max_size = load_banned_words()
@@ -1144,23 +1306,16 @@ def main() -> None:
             ANGLE_CUES, min(CANDIDATES_PER_DAY, len(ANGLE_CUES))
         )
 
-        # Track first words within this day's batch so each candidate
-        # is forced to start differently (same mechanism as the app's
-        # FIFO ban list, but scoped to this generation run)
-        day_banned = list(banned_words)
-
-        for n in range(1, CANDIDATES_PER_DAY + 1):
-            angle = angles[(n - 1) % len(angles)]
-            print(f"\n  Candidate {n}/{CANDIDATES_PER_DAY} ({angle[:45]}…):")
-            puzzle, day_banned = generate_puzzle(
-                client, dictionary, d, theme, day_banned, max_size,
-                angle_cue=angle, seed_words=seed_words,
+        results = generate_day(
+            client, dictionary, d, theme, banned_words, max_size,
+            angles, seed_words, day_dir, workers=args.workers,
+        )
+        if len(results) < CANDIDATES_PER_DAY:
+            missing = sorted(set(range(1, CANDIDATES_PER_DAY + 1)) - set(results))
+            print(
+                f"  !! {d}: only {len(results)}/{CANDIDATES_PER_DAY} "
+                f"candidates — slots {missing} failed (see errors above)"
             )
-            out_path = day_dir / f"{n}.json"
-            with open(out_path, "w") as f:
-                json.dump(puzzle, f, indent=2)
-                f.write("\n")
-            print(f"  Saved → candidates/{d.isoformat()}/{n}.json")
 
         generated_days += 1
 

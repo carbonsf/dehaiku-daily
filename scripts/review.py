@@ -670,9 +670,15 @@ async function pick(day, num) {
 /* ── Regenerate (live progress) ─────────── */
 // generate.py runs as a subprocess on the server; we poll its captured
 // stdout and parse the lines it prints into a stage + progress fraction.
-const G = { timer: null, since: 0, saved: 0, cur: 0, frac: 0, stage: '',
-            retry: false, all: [], day: null, start: 0 };
+// Per-candidate progress lives in G.c[n] = {frac, retry, done}. The generator
+// runs a day's candidates in parallel and prefixes every line "[n] ", so each
+// line is attributed by that prefix; an unprefixed line (older, sequential
+// output) falls back to G.cur, the last "Candidate n/8" header seen.
+const G = { timer: null, since: 0, cur: 0, stage: '', all: [], day: null, start: 0, c: {} };
 const TOTAL = 8;
+function savedCount() {
+  return Object.values(G.c).filter(function(x) { return x.done; }).length;
+}
 
 async function regenerate() {
   const day = S.cur;
@@ -696,7 +702,7 @@ async function regenerate() {
 }
 
 function beginGenPanel(day, elapsedSec) {
-  Object.assign(G, { since: 0, saved: 0, cur: 0, frac: 0, retry: false, all: [],
+  Object.assign(G, { since: 0, cur: 0, all: [], c: {},
                      day: day, stage: 'Starting generator…',
                      start: Date.now() - (elapsedSec || 0) * 1000 });
   const gen = document.getElementById('gen');
@@ -738,24 +744,32 @@ async function pollGeneration() {
 
 // Parse one stdout line from generate.py. Returns true when a candidate
 // was saved (so the grid can refresh).
-function ingestLine(raw) {
+function ingestLine(raw0) {
+  let raw = raw0, n = null, m;
+  if ((m = raw0.match(/^\[(\d+)\] ?([\s\S]*)$/))) { n = +m[1]; raw = m[2]; }
   const t = raw.trim();
   if (!t) return false;
-  let cls = '', saved = false, m;
-  const who = function() { return 'Candidate ' + G.cur + ' · '; };
-  if ((m = t.match(/^Candidate (\d+)\/(\d+)/))) {
-    G.cur = +m[1]; G.frac = 0.05; G.retry = false; G.stage = who() + 'picking an angle';
+  if (n === null && (m = t.match(/^Candidate (\d+)\/(\d+)/))) n = +m[1];   // unprefixed, sequential output
+  if (n !== null) G.cur = n;
+  const id = n !== null ? n : G.cur;
+  const c = id ? (G.c[id] = G.c[id] || { frac: 0, retry: false, done: false }) : null;
+  let cls = '', saved = false;
+  const who = function() { return 'Candidate ' + id + ' · '; };
+  if (!c) {
+    /* belongs to no candidate: run header, version line, done, errors */
+  } else if ((m = t.match(/^Candidate (\d+)\/(\d+)/))) {
+    c.frac = 0.05; c.retry = false; c.done = false; G.stage = who() + 'picking an angle';
   } else if ((m = t.match(/^Word pool attempt (\d+)\/(\d+)/))) {
-    G.frac = 0.1; G.retry = +m[1] > 1;
+    c.frac = 0.1; c.retry = +m[1] > 1;
     G.stage = who() + 'drawing 12 words' + (+m[1] > 1 ? ' (fresh pool ' + m[1] + '/' + m[2] + ')' : '');
   } else if (/^Answers:/.test(t)) {
-    G.frac = 0.18; G.stage = who() + 'writing the haiku';
+    c.frac = 0.18; G.stage = who() + 'writing the haiku';
   } else if (/^Pool \(12\)|^Decoys:/.test(t)) {
     /* informational */
   } else if (/^Haiku:/.test(t)) {
-    G.frac = 0.45; G.retry = false; G.stage = who() + 'haiku written — checking';
+    c.frac = 0.45; c.retry = false; G.stage = who() + 'haiku written — checking';
   } else if (/^Structure rejected|^Craft probe failed|^Haiku leaked|^Haiku rejected/.test(t)) {
-    cls = 'warn'; G.retry = true; G.frac = 0.3;
+    cls = 'warn'; c.retry = true; c.frac = 0.3;
     const body = t.replace(/\s*\(try \d+\/\d+\):?\s*/, ' ').trim();
     let why;
     if ((m = body.match(/^Structure rejected\s*(.*)/))) why = 'structure: ' + m[1];
@@ -765,45 +779,46 @@ function ingestLine(raw) {
     else why = body.replace(/^Haiku rejected\s*/, '');
     G.stage = who() + 'rewriting — ' + why;
   } else if ((m = t.match(/^Gate check \((\d+)\/(\d+)\)/))) {
-    G.frac = 0.55 + 0.09 * (+m[1]); G.retry = false;
+    c.frac = 0.55 + 0.09 * (+m[1]); c.retry = false;
     G.stage = who() + 'solver probes ' + m[1] + '/' + m[2];
   } else if (/^Gate failed/.test(t)) {
-    cls = 'warn'; G.retry = true;
+    cls = 'warn'; c.retry = true;
     G.stage = who() + 'gate: ' + t.replace(/^Gate failed\s*[—-]?\s*/, '') + ' — rewriting';
   } else if (/^Gate: fair but too obvious/.test(t)) {
-    cls = 'warn'; G.retry = true; G.stage = who() + 'fair but too obvious — rewriting';
+    cls = 'warn'; c.retry = true; G.stage = who() + 'fair but too obvious — rewriting';
   } else if (/^Gate passed/.test(t)) {
-    cls = 'good'; G.frac = 0.97; G.retry = false; G.stage = who() + 'passed ✓';
+    cls = 'good'; c.frac = 0.97; c.retry = false; G.stage = who() + 'passed ✓';
   } else if (/^Gate budget exhausted|^Could not produce|^All pools exhausted/.test(t)) {
-    cls = 'warn'; G.retry = true; G.stage = who() + t.charAt(0).toLowerCase() + t.slice(1);
+    cls = 'warn'; c.retry = true; G.stage = who() + t.charAt(0).toLowerCase() + t.slice(1);
+  } else if (/^First word .* collides/.test(t)) {
+    cls = 'warn'; c.retry = true; c.done = false; c.frac = 0.05;    // sent back for a new opening
+    G.stage = who() + t.charAt(0).toLowerCase() + t.slice(1).replace(/ — regenerating.*$/, '') + ' — regenerating';
   } else if (/^Saved →/.test(t)) {
-    cls = 'good'; G.saved = G.cur; G.frac = 0; saved = true;
-  } else if (/^Done\./.test(t)) {
-    cls = 'good';
-  } else if (/^Traceback|Error/.test(t)) {
-    cls = 'bad';
-  } else if (/^ {4}\S/.test(raw) && !/^\s*\[/.test(raw)) {
-    cls = 'verse';                          // the three printed haiku lines
+    cls = 'good'; c.done = true; c.frac = 1; saved = true;
+    G.stage = who() + 'saved ✓';
   }
-  G.all.push({ text: t, cls: cls });
+  if (/^Done\./.test(t)) cls = 'good';
+  else if (/^Traceback|Error|^!!/.test(t)) cls = 'bad';
+  else if (!cls && /^ {4}\S/.test(raw) && !/^\s*\[/.test(raw)) cls = 'verse';   // the three printed haiku lines
+  G.all.push({ text: (n !== null ? '[' + n + '] ' : '') + t, cls: cls });
   return saved;
 }
 
 function renderGen() {
   const segs = document.getElementById('genSegs').children;
   for (let i = 0; i < segs.length; i++) {
-    const n = i + 1, seg = segs[i], fill = seg.firstChild;
+    const n = i + 1, seg = segs[i], fill = seg.firstChild, c = G.c[n];
     let cls = 'seg', w = 0;
-    if (n <= G.saved) { cls += ' saved'; w = 100; }
-    else if (n === G.cur) { cls += ' active' + (G.retry ? ' retry' : ''); w = Math.round(G.frac * 100); }
+    if (c && c.done) { cls += ' saved'; w = 100; }
+    else if (c) { cls += ' active' + (c.retry ? ' retry' : ''); w = Math.round(c.frac * 100); }
     seg.className = cls;
     fill.style.width = w + '%';
   }
   document.getElementById('genStatus').innerHTML =
     '<span class="stage">' + esc(G.stage) + '</span>'
-    + '<span class="count">' + G.saved + ' / ' + TOTAL + ' saved</span>';
+    + '<span class="count">' + savedCount() + ' / ' + TOTAL + ' saved</span>';
   const gen = document.getElementById('gen');
-  const n = gen.classList.contains('fail') ? 14 : 7;
+  const n = gen.classList.contains('fail') ? 14 : 9;
   document.getElementById('genFeed').innerHTML = G.all.slice(-n).map(function(x) {
     return '<div class="ln' + (x.cls ? ' ' + x.cls : '') + '">' + esc(x.text) + '</div>';
   }).join('');
@@ -814,8 +829,7 @@ async function finishGen(st) {
   const gen = document.getElementById('gen');
   gen.classList.add(st.ok ? 'done' : 'fail');
   document.getElementById('genStop').hidden = true;
-  G.retry = false;
-  if (st.ok) { G.cur = 0; G.stage = 'Done — ' + G.saved + ' candidates ready'; }
+  if (st.ok) { G.stage = 'Done — ' + savedCount() + ' candidates ready'; }
   else { G.stage = st.message; }
   renderGen();
   const btn = document.getElementById('regenBtn');

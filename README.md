@@ -107,6 +107,9 @@ python3 scripts/generate.py --day 2026-06-15
 # Pick the generation recipe (see "Versions" below; case-insensitive, default POLISHED)
 python3 scripts/generate.py --version hybrid
 
+# A day's 8 candidates run in parallel by default; go one at a time if you're rate-limited
+python3 scripts/generate.py --workers 1
+
 # Seed words mixed into the 12-word pool (may land as answers or decoys)
 python3 scripts/generate.py --seeds "tree,gift,snow"
 
@@ -134,11 +137,11 @@ python3 scripts/generate.py --day 2026-12-25 --themes "christmas" --seeds "tree,
    - Up to 4 gate retries with craft-preserving feedback per word pool, 6 pools max (24 total tries)
    - Zero-trace (unfindable word) = hard fail, always rejected
    - Too-obvious = soft fail — tracks the best fair candidate; ships immediately on a full pass, falls back to fair-but-obvious if all 24 tries are obvious
-8. Repeat 8 times with distinct angle cues for diversity
-9. Each candidate's first word is banned for the next, preventing repetitive openings
+8. All 8 candidates for a day run **in parallel** (`--workers`, default 8), each with a distinct angle cue for diversity
+9. First words are kept distinct: after the batch lands, any candidates that open with the same word are regenerated together in a second parallel round with those words banned (up to 3 rounds). Every progress line is prefixed `[n]` so the review UI can show each candidate's own bar.
 
 **Environment variables:**
-- `ANTHROPIC_API_KEY` — required (env var, or `ANTHROPIC_API_KEY=...` in `.env` at the repo root)
+- `ANTHROPIC_API_KEY` — required (env var, or `ANTHROPIC_API_KEY=...` in `.env` at the repo root). The env var wins if both exist, so a stale `export` in `~/.zshrc` will shadow a fresh `.env`. The key is checked once at startup with a free call; a rejected key fails fast and names which source it came from.
 - `ANTHROPIC_MODEL` — override the generator/trace model (default: `claude-opus-5-5`)
 - `ANTHROPIC_CASUAL_MODEL` — override the probe model (default: `claude-sonnet-5`)
 - `ANTHROPIC_EFFORT` — how hard Opus thinks: `high` (default), `xhigh`, or `max`. Opus 5.5 always thinks, so this is the only quality dial. Don't drop below `high` — this is a batch job with nobody waiting, and a weak haiku just burns gate retries and fresh word pools.
