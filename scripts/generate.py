@@ -199,40 +199,105 @@ def puzzle_approved(d: date) -> bool:
     return puzzle_file.exists()
 
 
+MAX_PLAN_DAYS = 60
+
+
+def _parse_date(s: str, what: str) -> date:
+    try:
+        return date.fromisoformat(s.strip())
+    except ValueError:
+        raise ValueError(f"{what}: {s.strip()!r} is not a valid YYYY-MM-DD date") from None
+
+
 def select_days(
     today: date,
     explicit_day: str | None = None,
     n_themes: int = 0,
     force: bool = False,
     approved=puzzle_approved,
+    count: int | None = None,
+    start: date | None = None,
 ) -> list[date]:
     """Choose which days to generate for.
 
     Today is included when it has no approved puzzle — otherwise the app
     has nothing to serve today and you would need --force to fix it.
     Once today is approved the window starts tomorrow, so a routine run
-    never re-rolls the puzzle that is already live.
+    never re-rolls the puzzle that is already live. `start` overrides
+    that starting point.
 
-    --day always wins and names a single day. With --themes, scan forward
-    skipping approved days so every theme lands on a day that needs one.
-    Otherwise take a LOOKAHEAD_DAYS window; the caller skips approved
-    days inside it.
+    --day always wins: one date, or several comma-separated. With
+    --count N (or --themes, which implies one day per theme), scan
+    forward skipping approved days until N open days are found, so every
+    theme lands on a day that needs one. Otherwise take a LOOKAHEAD_DAYS
+    window; the caller skips approved days inside it.
     """
     if explicit_day:
-        return [date.fromisoformat(explicit_day)]
+        days = sorted({
+            _parse_date(s, "--day")
+            for s in explicit_day.split(",") if s.strip()
+        })
+        if not days:
+            raise ValueError("--day needs at least one YYYY-MM-DD date")
+        return days
 
-    start = today if (force or not approved(today)) else today + timedelta(days=1)
+    if start is None:
+        start = today if (force or not approved(today)) else today + timedelta(days=1)
 
-    if n_themes:
+    want = count or n_themes
+    if want:
+        if want > MAX_PLAN_DAYS:
+            raise ValueError(f"at most {MAX_PLAN_DAYS} days per run")
         days: list[date] = []
         d = start
-        while len(days) < n_themes:
+        while len(days) < want:
             if force or not approved(d):
                 days.append(d)
             d += timedelta(days=1)
         return days
 
     return [start + timedelta(days=i) for i in range(LOOKAHEAD_DAYS)]
+
+
+def plan_generation(
+    today: date,
+    day: str | None = None,
+    count: int | None = None,
+    start: str | date | None = None,
+    themes: list[str] | None = None,
+    force: bool = False,
+    rotation: list[str] | None = None,
+    approved=puzzle_approved,
+) -> list[dict]:
+    """The exact list of days a run will touch, in order, with the theme
+    each gets and whether it is generated or skipped.
+
+    main() executes this plan, and the review UI's preview shows it via
+    --dry-run --json, so what the preview says is what runs. Themes cycle
+    over the days actually generated (an approved day that is skipped
+    doesn't use one up).
+    """
+    if rotation is None:
+        rotation = load_themes()
+    if isinstance(start, str):
+        start = _parse_date(start, "--start")
+    days = select_days(
+        today, explicit_day=day, n_themes=len(themes) if themes else 0,
+        force=force, approved=approved, count=count, start=start,
+    )
+    plan, i = [], 0
+    for d in days:
+        is_approved = approved(d)
+        existing = len(list((CANDIDATES_DIR / d.isoformat()).glob("*.json")))
+        if is_approved and not force:
+            plan.append(dict(date=d, theme=None, action="skip",
+                             approved=True, existing=existing))
+            continue
+        theme = themes[i % len(themes)] if themes else get_theme_for_date(d, rotation)
+        i += 1
+        plan.append(dict(date=d, theme=theme, action="generate",
+                         approved=is_approved, existing=existing))
+    return plan
 
 
 # ── Syllable counting (5/7/5 validation) ───────────────────
@@ -1123,7 +1188,7 @@ def generate_day(
 
     for rnd in range(1, MAX_BAN_ROUNDS + 1):
         with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
-            futures = [ex.submit(work, n) for n in pending]
+            futures = {ex.submit(work, n): n for n in pending}
             for fut in as_completed(futures):
                 try:
                     n, puzzle = fut.result()
@@ -1131,7 +1196,7 @@ def generate_day(
                 except Exception as e:  # keep the rest of the day alive
                     with _PRINT_LOCK:
                         print(
-                            f"  !! a candidate failed: "
+                            f"[{futures[fut]}]   !! candidate failed: "
                             f"{type(e).__name__}: {e}",
                             flush=True,
                         )
@@ -1181,7 +1246,22 @@ def parse_args():
     )
     p.add_argument(
         "--day",
-        help="Start date (YYYY-MM-DD). Defaults to tomorrow.",
+        help="Generate exactly these dates: one YYYY-MM-DD, or several "
+             "comma-separated. Overrides --count and --start.",
+    )
+    p.add_argument(
+        "--count",
+        type=int,
+        metavar="N",
+        help="Generate N open days (approved days are skipped and don't "
+             "count). Default: a 7-day window, or one day per theme when "
+             "--themes is given.",
+    )
+    p.add_argument(
+        "--start",
+        metavar="YYYY-MM-DD",
+        help="Where to start looking for days. Default: today if it has "
+             "no approved puzzle, otherwise tomorrow.",
     )
     p.add_argument(
         "--themes",
@@ -1219,13 +1299,77 @@ def parse_args():
     p.add_argument(
         "--force",
         action="store_true",
-        help="Regenerate even if candidates already exist for that day",
+        help="Also generate for days that are already approved (their "
+             "candidates are replaced; the approved puzzle is untouched)",
+    )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print which days would be generated, with themes, and exit. "
+             "No API calls.",
+    )
+    p.add_argument(
+        "--json",
+        action="store_true",
+        help="With --dry-run: print the plan as JSON (used by the review UI).",
     )
     return p.parse_args()
 
 
+def _parse_themes(raw: str | None) -> list[str] | None:
+    if not raw:
+        return None
+    themes = [t.strip() for t in raw.split(",") if t.strip()]
+    if not themes:
+        raise ValueError("--themes requires at least one theme")
+    return themes
+
+
+def _print_plan(plan: list[dict], as_json: bool) -> None:
+    if as_json:
+        print(json.dumps({"plan": [
+            {**p, "date": p["date"].isoformat()} for p in plan
+        ]}))
+        return
+    gen = [p for p in plan if p["action"] == "generate"]
+    print(f"Plan: {len(gen)} day(s), {len(gen) * CANDIDATES_PER_DAY} candidates")
+    for p in plan:
+        d = p["date"]
+        if p["action"] == "skip":
+            print(f"  {d} {d:%a}  skip — already approved")
+            continue
+        notes = []
+        if p["approved"]:
+            notes.append("approved; candidates regenerated, live puzzle kept")
+        if p["existing"]:
+            notes.append(f"replaces {p['existing']} unreviewed candidates")
+        print(f"  {d} {d:%a}  {p['theme']}" + (f"   ({'; '.join(notes)})" if notes else ""))
+
+
 def main() -> None:
     args = parse_args()
+
+    # Work out the plan first: --dry-run needs nothing else, and a bad
+    # date or theme list should fail before any API key is checked.
+    try:
+        explicit_themes = _parse_themes(args.themes)
+        if args.count is not None and args.count < 1:
+            raise ValueError("--count must be at least 1")
+        today = date.today()
+        plan = plan_generation(
+            today, day=args.day, count=args.count, start=args.start,
+            themes=explicit_themes, force=args.force,
+        )
+    except ValueError as e:
+        if args.dry_run and args.json:
+            print(json.dumps({"error": str(e)}))
+        else:
+            print(f"Error: {e}")
+        sys.exit(2)
+    if args.dry_run:
+        _print_plan(plan, args.json)
+        return
+
     set_version(args.version)
     print(f"Version: {VERSION}")
     api_key = load_api_key()
@@ -1240,7 +1384,6 @@ def main() -> None:
     client = anthropic.Anthropic(api_key=api_key, max_retries=5)
     check_api_key(client)
     dictionary = load_dictionary()
-    rotation_themes = load_themes()
     banned_words, max_size = load_banned_words()
     print(f"Dictionary loaded: {len(dictionary)} words")
 
@@ -1255,37 +1398,14 @@ def main() -> None:
             sys.exit(1)
         print(f"Seed words ({len(seed_words)}): {seed_words}")
 
-    # Parse optional explicit theme list
-    explicit_themes: list[str] | None = None
-    if args.themes:
-        explicit_themes = [
-            t.strip() for t in args.themes.split(",") if t.strip()
-        ]
-        if not explicit_themes:
-            print("Error: --themes requires at least one theme")
-            sys.exit(1)
-
-    today = date.today()
-    days = select_days(
-        today=today,
-        explicit_day=args.day,
-        n_themes=len(explicit_themes) if explicit_themes else 0,
-        force=args.force,
-    )
-    if not args.day and days and days[0] == today:
+    if not args.day and not args.start and plan and plan[0]["date"] == today:
         print("Today has no approved puzzle — starting from today.")
-
-    themes_pool = explicit_themes if explicit_themes else rotation_themes
-    day_themes = [
-        (d, themes_pool[i % len(themes_pool)] if explicit_themes
-         else get_theme_for_date(d, rotation_themes))
-        for i, d in enumerate(days)
-    ]
 
     generated_days = 0
 
-    for d, theme in day_themes:
-        if not args.force and puzzle_approved(d):
+    for item in plan:
+        d, theme = item["date"], item["theme"]
+        if item["action"] == "skip":
             print(f"Skipping {d} — already approved")
             continue
 

@@ -177,18 +177,35 @@ def _update_banned_words(puzzle):
 # render live progress. One job at a time. Because it is a fresh
 # subprocess each time, it always runs the current generate.py on disk.
 
+#
+# Two kinds of job share this runner:
+#   "regen"  the per-day Regenerate bar: one day, --force
+#   "batch"  the + panel: any set of days with every generate.py option
+# Only one runs at a time, whichever kind.
+
+GENERATE_PY = str(REPO_ROOT / "scripts" / "generate.py")
+MAX_WORKERS = 8
+
 JOB_LOCK = threading.Lock()
 JOB = {
     "running": False, "date": None, "lines": [], "done": False,
     "ok": None, "message": "", "started": 0.0, "proc": None,
+    "kind": None, "label": None, "plan": [],
 }
 
+_NO_KEY_MESSAGE = (
+    "ANTHROPIC_API_KEY not set. Export it in the shell that runs "
+    "review.py, or put ANTHROPIC_API_KEY=sk-ant-... in a .env "
+    "file at the repo root, then restart review.py."
+)
 
-def start_regeneration(day_str, seeds_csv="", theme="", version=""):
-    """Kick off generate.py for one day in the background."""
+
+def _spawn_job(cmd, kind, label, day_str=None, plan=None, ok_message=""):
+    """Run generate.py in the background and stream its output into JOB.
+    Returns an error string, or None once the job is running."""
     with JOB_LOCK:
         if JOB["running"]:
-            return {"ok": False, "message": f"Already generating {JOB['date']}."}
+            return f"Already generating {JOB['label']}."
 
     # Resolve the key here so a missing key is a clear message instead of
     # a traceback, and pass it explicitly — this server may have been
@@ -196,28 +213,7 @@ def start_regeneration(day_str, seeds_csv="", theme="", version=""):
     from generate import load_api_key
     api_key = load_api_key()
     if not api_key:
-        return {
-            "ok": False,
-            "message": (
-                "ANTHROPIC_API_KEY not set. Export it in the shell that runs "
-                "review.py, or put ANTHROPIC_API_KEY=sk-ant-... in a .env "
-                "file at the repo root, then restart review.py."
-            ),
-        }
-
-    # -u = unbuffered stdout so lines arrive as they are printed
-    cmd = [
-        sys.executable, "-u",
-        str(REPO_ROOT / "scripts" / "generate.py"),
-        "--day", day_str,
-        "--force",
-    ]
-    if seeds_csv.strip():
-        cmd.extend(["--seeds", seeds_csv.strip()])
-    if theme.strip():
-        cmd.extend(["--themes", theme.strip()])
-    if version.strip():
-        cmd.extend(["--version", version.strip()])
+        return _NO_KEY_MESSAGE
 
     proc = subprocess.Popen(
         cmd, cwd=REPO_ROOT,
@@ -229,6 +225,7 @@ def start_regeneration(day_str, seeds_csv="", theme="", version=""):
         JOB.update(
             running=True, date=day_str, lines=[], done=False, ok=None,
             message="", started=time.time(), proc=proc,
+            kind=kind, label=label, plan=plan or [],
         )
 
     def pump():
@@ -241,14 +238,190 @@ def start_regeneration(day_str, seeds_csv="", theme="", version=""):
             JOB["done"] = True
             JOB["ok"] = code == 0
             if code == 0:
-                JOB["message"] = "Regenerated candidates."
+                JOB["message"] = ok_message
             elif code < 0:
                 JOB["message"] = "Generation cancelled."
             else:
                 JOB["message"] = f"Generation failed (exit {code})."
 
     threading.Thread(target=pump, daemon=True).start()
+    return None
+
+
+def start_regeneration(day_str, seeds_csv="", theme="", version=""):
+    """Kick off generate.py for one day in the background."""
+    # -u = unbuffered stdout so lines arrive as they are printed
+    cmd = [
+        sys.executable, "-u",
+        GENERATE_PY,
+        "--day", day_str,
+        "--force",
+    ]
+    if seeds_csv.strip():
+        cmd.extend(["--seeds", seeds_csv.strip()])
+    if theme.strip():
+        cmd.extend(["--themes", theme.strip()])
+    if version.strip():
+        cmd.extend(["--version", version.strip()])
+
+    err = _spawn_job(cmd, "regen", label=day_str, day_str=day_str,
+                     ok_message="Regenerated candidates.")
+    if err:
+        return {"ok": False, "message": err}
     return {"ok": True, "message": f"Generating {day_str}…"}
+
+
+# ── Batch generation (the + panel) ───────────────────────────
+
+
+def generate_options():
+    """What the + panel needs to build its form."""
+    from generate import VERSIONS, LOOKAHEAD_DAYS, CANDIDATES_PER_DAY, MAX_PLAN_DAYS
+    with open(CONFIG_DIR / "themes.json") as f:
+        rotation = json.load(f)["rotation"]
+    return {
+        "today": date.today().isoformat(),
+        "versions": list(VERSIONS),
+        "default_version": "POLISHED",
+        "rotation": rotation,
+        "lookahead": LOOKAHEAD_DAYS,
+        "per_day": CANDIDATES_PER_DAY,
+        "max_days": MAX_PLAN_DAYS,
+        "max_workers": MAX_WORKERS,
+    }
+
+
+def _batch_day_args(o):
+    """Validate the 'which days / themes / force' part of a request and
+    turn it into generate.py arguments. Raises ValueError for the user."""
+    today = date.today()
+
+    def future_date(s, what):
+        try:
+            d = date.fromisoformat(str(s).strip())
+        except ValueError:
+            raise ValueError(f"{what}: {s!r} is not a valid date") from None
+        if d < today:
+            raise ValueError(
+                f"{what}: {d:%b} {d.day} is in the past — the review app only "
+                f"shows today and later"
+            )
+        return d
+
+    def day_count():
+        try:
+            n = int(o.get("count", 0))
+        except (TypeError, ValueError):
+            raise ValueError("Number of days must be a whole number") from None
+        if not 1 <= n <= 60:
+            raise ValueError("Number of days must be between 1 and 60")
+        return n
+
+    args = []
+    mode = o.get("mode", "next")
+    if mode == "next":
+        args += ["--count", str(day_count())]
+    elif mode == "from":
+        start = future_date(o.get("start", ""), "Start date")
+        args += ["--start", start.isoformat(), "--count", str(day_count())]
+    elif mode == "dates":
+        dates = sorted({future_date(s, "Date") for s in (o.get("dates") or [])})
+        if not dates:
+            raise ValueError("Add at least one date")
+        args += ["--day", ",".join(d.isoformat() for d in dates)]
+    else:
+        raise ValueError(f"Unknown mode {mode!r}")
+
+    themes = [str(t).strip() for t in (o.get("themes") or []) if str(t).strip()]
+    for t in themes:
+        if "," in t:
+            raise ValueError(f"Themes can't contain commas: {t!r}")
+    if themes:
+        args += ["--themes", ",".join(themes)]
+    if o.get("force"):
+        args.append("--force")
+    return args
+
+
+def plan_batch(o):
+    """Ask generate.py itself which days a run would touch (--dry-run), so
+    the preview is computed by the same code that will run."""
+    try:
+        args = _batch_day_args(o)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    r = subprocess.run(
+        [sys.executable, GENERATE_PY, "--dry-run", "--json", *args],
+        cwd=REPO_ROOT, capture_output=True, text=True, timeout=30,
+    )
+    try:
+        out = json.loads(r.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        err = (r.stderr or r.stdout).strip().splitlines()
+        return {"ok": False, "error": err[-1] if err else "Couldn't compute the plan"}
+    if "error" in out:
+        return {"ok": False, "error": out["error"]}
+    return {"ok": True, "plan": out["plan"]}
+
+
+def _range_label(dates):
+    def short(s):
+        d = date.fromisoformat(s)
+        return f"{d:%b} {d.day}"
+    if len(dates) == 1:
+        return short(dates[0])
+    return f"{len(dates)} days · {short(dates[0])} – {short(dates[-1])}"
+
+
+def start_batch(o):
+    """Start a batch run of exactly the days the preview showed."""
+    from generate import VERSIONS
+    planned = plan_batch(o)
+    if not planned["ok"]:
+        return {"ok": False, "message": planned["error"]}
+    gen = [p for p in planned["plan"] if p["action"] == "generate"]
+    if not gen:
+        return {"ok": False, "message": (
+            "Nothing to generate — every day in that selection already has an "
+            "approved puzzle. Tick “Include approved days” to redo them."
+        )}
+
+    version = str(o.get("version") or "POLISHED").strip().upper()
+    if version not in VERSIONS:
+        return {"ok": False, "message": f"Unknown version {version!r}"}
+    try:
+        workers = int(o.get("workers", MAX_WORKERS))
+    except (TypeError, ValueError):
+        workers = 0
+    if not 1 <= workers <= MAX_WORKERS:
+        return {"ok": False, "message": f"Parallel candidates must be 1–{MAX_WORKERS}"}
+    seeds = [w.strip().lower() for w in str(o.get("seeds") or "").split(",") if w.strip()]
+    if len(seeds) > 11:
+        return {"ok": False, "message": "Seed words: at most 11 (the pool is 12)"}
+
+    # Pin the run to the previewed dates: if a day gets approved between
+    # preview and click it is skipped rather than surprising you.
+    dates = [p["date"] for p in gen]
+    cmd = [sys.executable, "-u", GENERATE_PY, "--day", ",".join(dates),
+           "--version", version, "--workers", str(workers)]
+    themes = [str(t).strip() for t in (o.get("themes") or []) if str(t).strip()]
+    if themes:
+        cmd += ["--themes", ",".join(themes)]
+    if seeds:
+        cmd += ["--seeds", ",".join(seeds)]
+    if o.get("force"):
+        cmd.append("--force")
+
+    label = _range_label(dates)
+    n = len(dates)
+    err = _spawn_job(
+        cmd, "batch", label=label,
+        plan=[{"date": p["date"], "theme": p["theme"]} for p in gen],
+        ok_message=f"Generated {n} day{'s' if n != 1 else ''} of candidates.",
+    )
+    if err:
+        return {"ok": False, "message": err}
+    return {"ok": True, "message": f"Generating {label}…", "label": label}
 
 
 def regeneration_status(since=0):
@@ -263,6 +436,9 @@ def regeneration_status(since=0):
             "elapsed": (time.time() - JOB["started"]) if JOB["started"] else 0,
             "lines": JOB["lines"][since:],
             "total": len(JOB["lines"]),
+            "kind": JOB["kind"],
+            "label": JOB["label"],
+            "plan": JOB["plan"],
         }
 
 
@@ -329,6 +505,8 @@ class ReviewHandler(http.server.BaseHTTPRequestHandler):
             qs = parse_qs(urlparse(self.path).query)
             since = int(qs.get("since", ["0"])[0] or 0)
             self._json(regeneration_status(since))
+        elif self.path == "/api/generate/options":
+            self._json(generate_options())
         else:
             self.send_error(404)
 
@@ -346,6 +524,10 @@ class ReviewHandler(http.server.BaseHTTPRequestHandler):
             ))
         elif self.path == "/api/regenerate/cancel":
             self._json(cancel_regeneration())
+        elif self.path == "/api/generate/plan":
+            self._json(plan_batch(body))
+        elif self.path == "/api/generate":
+            self._json(start_batch(body))
         elif self.path == "/api/push":
             self._json(git_commit_and_push())
         else:
@@ -486,6 +668,7 @@ header h1{font-size:16px;font-weight:600;letter-spacing:.02em}
 .seg.active.retry .fill{background:linear-gradient(90deg,#f59e0b,#fde68a,#f59e0b);background-size:200% 100%;animation:genShimmer .5s linear infinite}
 @keyframes genShimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}
 .gen.done .seg .fill,.gen.fail .seg .fill{animation:none}
+.seg.failed .fill{background:#dc2626}
 .gen.fail .seg.active .fill{background:#dc2626}
 .gen-status{display:flex;justify-content:space-between;gap:12px;margin-bottom:8px}
 .gen-status .stage{font-weight:500;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -501,6 +684,85 @@ header h1{font-size:16px;font-weight:600;letter-spacing:.02em}
 /* ── Unapprove ─────────────────────────── */
 .unapprove-btn{margin-top:12px;padding:6px 18px;background:transparent;color:var(--muted);border:1px solid var(--border);border-radius:6px;font-size:13px;cursor:pointer;font-family:inherit;transition:all .15s}
 .unapprove-btn:hover{color:#dc2626;border-color:#dc2626}
+
+/* ── + pill and batch states in the day nav ── */
+.add-pill{flex:none;width:30px;height:30px;border-radius:50%;border:1px dashed #a8a29e;background:var(--surface);color:var(--muted);font-size:18px;line-height:1;cursor:pointer;font-family:inherit;transition:all .15s;display:flex;align-items:center;justify-content:center}
+.add-pill:hover{border-style:solid;border-color:var(--accent);color:var(--accent);background:#eff6ff}
+.day-pill.ghost{border-style:dashed;color:var(--muted);background:transparent}
+.day-pill.genning{position:relative;border-color:#f97316;box-shadow:0 0 0 0 rgba(249,115,22,.5);animation:pillPulse 1.4s ease-out infinite}
+.day-pill.active.genning{background:#f97316;color:#fff}
+@keyframes pillPulse{0%{box-shadow:0 0 0 0 rgba(249,115,22,.45)}100%{box-shadow:0 0 0 7px rgba(249,115,22,0)}}
+
+/* ── Batch day strip in the live panel ── */
+.gen-days{display:flex;flex-wrap:wrap;gap:5px;margin:-2px 0 10px}
+.gen-days:empty{display:none}
+.gday{padding:2px 9px;border-radius:9px;font-size:11px;font-weight:600;background:#27272a;color:#9ca3af;font-variant-numeric:tabular-nums}
+.gday.active{background:#f97316;color:#fff}
+.gday.done{background:#14532d;color:#86efac}
+.gday.partial{background:#713f12;color:#fde68a}
+.gday.skipped{text-decoration:line-through;opacity:.6}
+
+/* ── Create dailies panel ── */
+.cm-overlay{position:fixed;inset:0;background:rgba(17,17,17,.45);z-index:300;display:flex;align-items:flex-start;justify-content:center;padding:48px 16px;overflow-y:auto}
+.cm-overlay[hidden]{display:none}
+.cm{background:var(--surface);border-radius:14px;width:100%;max-width:680px;box-shadow:0 20px 60px rgba(0,0,0,.25);display:flex;flex-direction:column}
+.cm-head{display:flex;align-items:center;justify-content:space-between;padding:18px 22px 10px}
+.cm-head h3{font-size:17px;font-weight:700}
+.cm-x{border:none;background:transparent;font-size:22px;line-height:1;color:var(--muted);cursor:pointer;padding:4px 8px;border-radius:6px}
+.cm-x:hover{background:var(--dec-bg);color:var(--text)}
+.cm-body{padding:4px 22px 8px;display:flex;flex-direction:column;gap:18px}
+.cm-sec h4{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:8px}
+.cm-hint{font-size:12px;color:var(--muted);margin-top:6px;line-height:1.5}
+.cm-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.cm input[type=text],.cm input[type=number],.cm input[type=date],.cm textarea,.cm select{padding:7px 10px;border:1px solid var(--border);border-radius:7px;font-size:13px;font-family:inherit;background:var(--surface);color:var(--text)}
+.cm input:focus,.cm textarea:focus,.cm select:focus{outline:none;border-color:var(--accent)}
+.cm input[type=number]{width:76px}
+.cm textarea{width:100%;min-height:68px;resize:vertical;line-height:1.5}
+.cm input.wide{width:100%}
+.seg-ctl{display:inline-flex;border:1px solid var(--border);border-radius:8px;overflow:hidden}
+.seg-ctl button{border:none;background:var(--surface);padding:7px 14px;font-size:13px;font-family:inherit;cursor:pointer;color:var(--text);border-right:1px solid var(--border)}
+.seg-ctl button:last-child{border-right:none}
+.seg-ctl button.on{background:var(--accent);color:#fff}
+.cm-mode{margin-top:10px}
+.cm-mode[hidden]{display:none}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.chip{display:inline-flex;align-items:center;gap:6px;padding:3px 6px 3px 10px;border-radius:12px;background:var(--ans-bg);color:var(--ans-text);font-size:12px;font-weight:600}
+.chip button{border:none;background:transparent;color:inherit;cursor:pointer;font-size:14px;line-height:1;padding:0 3px;border-radius:50%}
+.chip button:hover{background:rgba(30,64,175,.15)}
+.cm-check{display:flex;gap:8px;align-items:flex-start;font-size:13px;margin-top:12px;cursor:pointer}
+.cm-check input{margin-top:2px}
+.recipes{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+@media(max-width:560px){.recipes{grid-template-columns:1fr}}
+.recipe{border:2px solid var(--border);border-radius:10px;padding:10px 12px;cursor:pointer;text-align:left;background:var(--surface);font-family:inherit;color:var(--text)}
+.recipe:hover{border-color:#b0b0b0}
+.recipe.on{border-color:var(--accent);background:#eff6ff}
+.recipe b{display:block;font-size:12px;letter-spacing:.05em;margin-bottom:3px}
+.recipe span{font-size:12px;color:var(--muted);line-height:1.4}
+.cm-preview{border:1px solid var(--border);border-radius:10px;overflow:hidden}
+.cm-preview .sum{padding:9px 12px;font-size:13px;font-weight:600;background:var(--bg);border-bottom:1px solid var(--border);display:flex;justify-content:space-between;gap:10px}
+.cm-preview .sum .sub{font-weight:400;color:var(--muted)}
+.cm-preview .rows{max-height:240px;overflow-y:auto}
+.prow{display:grid;grid-template-columns:92px 1fr auto;gap:10px;padding:7px 12px;font-size:13px;border-bottom:1px solid var(--border);align-items:center}
+.prow:last-child{border-bottom:none}
+.prow .d{font-variant-numeric:tabular-nums;color:var(--muted)}
+.prow .d b{color:var(--text);font-weight:600}
+.prow .th{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.prow.skip{color:var(--muted)}
+.prow.skip .th{text-decoration:line-through}
+.badge{font-size:10.5px;font-weight:700;padding:2px 8px;border-radius:9px;white-space:nowrap}
+.badge.new{background:var(--green-bg);color:#166534}
+.badge.repl{background:#fef3c7;color:#92400e}
+.badge.redo{background:#fee2e2;color:#991b1b}
+.badge.skip{background:var(--dec-bg);color:var(--dec-text)}
+.cm-err{padding:10px 12px;font-size:13px;color:#991b1b;background:#fef2f2}
+.cm-busy{padding:9px 12px;font-size:13px;background:#fff7ed;color:#9a3412;border-radius:8px}
+.cm-busy[hidden]{display:none}
+.cm-foot{display:flex;justify-content:flex-end;align-items:center;gap:10px;padding:14px 22px 18px;border-top:1px solid var(--border);margin-top:10px}
+.cm-foot .left{margin-right:auto;font-size:12px;color:var(--muted)}
+.cm-cancel{padding:8px 16px;border:1px solid var(--border);background:var(--surface);border-radius:7px;font-size:13px;cursor:pointer;font-family:inherit;color:var(--text)}
+.cm-go{padding:8px 18px;border:none;background:#f97316;color:#fff;border-radius:7px;font-size:13px;font-weight:700;cursor:pointer;font-family:inherit}
+.cm-go:hover{background:#ea580c}
+.cm-go:disabled{opacity:.45;cursor:not-allowed}
 </style>
 </head>
 <body>
@@ -531,12 +793,84 @@ header h1{font-size:16px;font-weight:600;letter-spacing:.02em}
     <span class="gen-elapsed" id="genElapsed">0:00</span>
     <button class="gen-stop" id="genStop" onclick="cancelGeneration()">Stop</button>
   </div>
+  <div class="gen-days" id="genDays"></div>
   <div class="gen-segs" id="genSegs"></div>
   <div class="gen-status" id="genStatus"></div>
   <div class="gen-feed" id="genFeed"></div>
 </div>
 <div class="grid" id="grid"></div>
 <div class="toast" id="toast"></div>
+
+<div class="cm-overlay" id="cmOverlay" hidden onclick="if (event.target === this) closeCreate()">
+  <div class="cm" role="dialog" aria-modal="true" aria-labelledby="cmTitle">
+    <div class="cm-head">
+      <h3 id="cmTitle">Create dailies</h3>
+      <button class="cm-x" onclick="closeCreate()" aria-label="Close">×</button>
+    </div>
+    <div class="cm-body">
+      <div class="cm-busy" id="cmBusy" hidden></div>
+
+      <div class="cm-sec">
+        <h4>Days</h4>
+        <div class="seg-ctl" id="cmModes">
+          <button data-mode="next" onclick="setMode('next')">Next open days</button>
+          <button data-mode="from" onclick="setMode('from')">Starting from</button>
+          <button data-mode="dates" onclick="setMode('dates')">Specific dates</button>
+        </div>
+        <div class="cm-mode" id="cmMode-next">
+          <div class="cm-row"><input type="number" id="cmCountNext" min="1" max="60" value="7" oninput="cmChanged()"> <span>days</span></div>
+          <div class="cm-hint">Starts today if today has no puzzle yet, otherwise tomorrow. Days that are already approved are skipped and don't count.</div>
+        </div>
+        <div class="cm-mode" id="cmMode-from" hidden>
+          <div class="cm-row"><input type="date" id="cmStart" oninput="cmChanged()"> <span>for</span> <input type="number" id="cmCountFrom" min="1" max="60" value="7" oninput="cmChanged()"> <span>days</span></div>
+          <div class="cm-hint">Approved days from that date on are skipped and don't count.</div>
+        </div>
+        <div class="cm-mode" id="cmMode-dates" hidden>
+          <div class="cm-row"><input type="date" id="cmDateAdd" onkeydown="if (event.key === 'Enter') addDate()"> <button class="cm-cancel" onclick="addDate()">Add date</button></div>
+          <div class="chips" id="cmChips"></div>
+        </div>
+        <label class="cm-check"><input type="checkbox" id="cmForce" onchange="cmChanged()"> <span>Include days that are already approved<br><span class="cm-hint">Makes 8 new candidates for them. The approved puzzle stays live until you unapprove and re-pick.</span></span></label>
+      </div>
+
+      <div class="cm-sec">
+        <h4>Themes</h4>
+        <textarea id="cmThemes" placeholder="One per line (or comma-separated). They cycle across the days.&#10;Leave empty to use the rotation." oninput="cmChanged()"></textarea>
+        <div class="cm-hint" id="cmRotation"></div>
+      </div>
+
+      <div class="cm-sec">
+        <h4>Seed words</h4>
+        <input type="text" class="wide" id="cmSeeds" placeholder="Optional, comma-separated (e.g. tree, gift, snow)" oninput="cmChanged()">
+        <div class="cm-hint">Mixed into every candidate's 12-word pool — they may land as answers or decoys. Up to 11.</div>
+      </div>
+
+      <div class="cm-sec">
+        <h4>Recipe</h4>
+        <div class="recipes" id="cmRecipes">
+          <button class="recipe" data-v="POLISHED" onclick="setRecipe('POLISHED')"><b>POLISHED</b><span>Punctuated sentence with a turn; line-end commas stripped. Default.</span></button>
+          <button class="recipe" data-v="CHOPPED" onclick="setRecipe('CHOPPED')"><b>CHOPPED</b><span>The no-commas recipe: bare, terse, imagistic lines.</span></button>
+          <button class="recipe" data-v="HYBRID" onclick="setRecipe('HYBRID')"><b>HYBRID</b><span>CHOPPED's prompt on POLISHED's checks.</span></button>
+        </div>
+      </div>
+
+      <div class="cm-sec">
+        <h4>Speed</h4>
+        <div class="cm-row"><select id="cmWorkers" onchange="cmChanged()"></select> <span>candidates generated at once</span></div>
+        <div class="cm-hint">8 makes a whole day in one round. Lower it if you hit rate limits. Days themselves run one after another.</div>
+      </div>
+
+      <div class="cm-sec">
+        <h4>Preview</h4>
+        <div class="cm-preview" id="cmPreview"><div class="cm-err">Loading…</div></div>
+      </div>
+    </div>
+    <div class="cm-foot">
+      <span class="left" id="cmFootNote"></span>
+      <button class="cm-cancel" onclick="closeCreate()">Cancel</button>
+      <button class="cm-go" id="cmGo" onclick="startCreate()" disabled>Generate</button>
+    </div>
+  </div>
+</div>
 
 <script>
 const S = { days: [], cur: null };
@@ -561,7 +895,10 @@ async function init() {
   renderProgress();
   // If the page was refreshed mid-generation, pick the panel back up.
   const st = await api('/api/regenerate/status');
-  if (st.running) {
+  if (st.running && st.kind === 'batch') {
+    beginBatchPanel(st.label, st.plan, st.elapsed);
+    pollGeneration();
+  } else if (st.running) {
     selectDay(st.date);
     beginGenPanel(st.date, st.elapsed);
     pollGeneration();
@@ -570,14 +907,32 @@ async function init() {
 
 /* ── Nav ────────────────────────────────── */
 function renderNav() {
-  document.getElementById('dayNav').innerHTML = S.days.map(d => {
+  // While a batch runs, days it hasn't reached yet show as dashed "ghost"
+  // pills and the day being generated pulses.
+  const items = S.days.slice();
+  const batch = G.running && G.kind === 'batch';
+  if (batch) {
+    const known = new Set(S.days.map(function(d) { return d.date; }));
+    G.plan.forEach(function(p) { if (!known.has(p.date)) items.push({ date: p.date, ghost: true }); });
+    items.sort(function(a, b) { return a.date < b.date ? -1 : a.date > b.date ? 1 : 0; });
+  }
+  document.getElementById('dayNav').innerHTML = items.map(d => {
     const cls = ['day-pill'];
     if (d.date === S.cur) cls.push('active');
     if (d.approved) cls.push('done');
+    if (d.ghost) cls.push('ghost');
+    if (batch && d.date === G.day) cls.push('genning');
     const label = shortDate(d.date);
-    return '<button class="' + cls.join(' ') + '" onclick="selectDay(\'' + d.date + '\')">'
+    return '<button class="' + cls.join(' ') + '" onclick="pillClick(\'' + d.date + '\')">'
       + (d.approved ? '✓ ' : '') + label + '</button>';
-  }).join('');
+  }).join('')
+    + '<button class="add-pill" onclick="openCreate()" title="Create dailies" aria-label="Create dailies">+</button>';
+}
+
+// A pill click is the user navigating, so a running batch stops auto-following.
+function pillClick(day) {
+  G.follow = false;
+  selectDay(day);
 }
 
 function renderProgress() {
@@ -674,7 +1029,14 @@ async function pick(day, num) {
 // runs a day's candidates in parallel and prefixes every line "[n] ", so each
 // line is attributed by that prefix; an unprefixed line (older, sequential
 // output) falls back to G.cur, the last "Candidate n/8" header seen.
-const G = { timer: null, since: 0, cur: 0, stage: '', all: [], day: null, start: 0, c: {} };
+//
+// A batch job (the + panel) runs several days one after another. For those,
+// G.kind is 'batch', G.plan lists the days, G.dayState tracks each one, and
+// G.c resets at every "Generating 8 candidates for <date>" header so the eight
+// segments always show the day in progress.
+const G = { timer: null, since: 0, cur: 0, stage: '', all: [], day: null, start: 0, c: {},
+            kind: null, running: false, plan: [], dayState: {}, label: '',
+            follow: false, newDay: null, savedTotal: 0 };
 const TOTAL = 8;
 function savedCount() {
   return Object.values(G.c).filter(function(x) { return x.done; }).length;
@@ -704,7 +1066,10 @@ async function regenerate() {
 function beginGenPanel(day, elapsedSec) {
   Object.assign(G, { since: 0, cur: 0, all: [], c: {},
                      day: day, stage: 'Starting generator…',
-                     start: Date.now() - (elapsedSec || 0) * 1000 });
+                     start: Date.now() - (elapsedSec || 0) * 1000,
+                     kind: 'regen', running: true, plan: [], dayState: {}, label: day,
+                     follow: false, newDay: null, savedTotal: 0 });
+  document.getElementById('genDays').innerHTML = '';
   const gen = document.getElementById('gen');
   gen.classList.remove('done', 'fail');
   gen.hidden = false;
@@ -737,9 +1102,37 @@ async function pollGeneration() {
   let landed = false;
   st.lines.forEach(function(l) { if (ingestLine(l)) landed = true; });
   renderGen();
-  if (landed) selectDay(G.day);            // cards appear as they land
+  if (G.kind === 'batch') {
+    if (G.newDay) {                        // the run moved on to a new day
+      const d = G.newDay; G.newDay = null;
+      renderNav();
+      if (G.follow) showPendingDay(d);
+    }
+    if (landed) await onBatchLanded();
+  } else if (landed) selectDay(G.day);     // cards appear as they land
   if (st.running) { setTimeout(pollGeneration, 600); return; }
   finishGen(st);
+}
+
+// A batch saved a candidate: refresh the nav (so the day's pill appears or
+// updates) and redraw the grid only if the user is looking at that day.
+async function onBatchLanded() {
+  S.days = await api('/api/status');
+  renderNav();
+  renderProgress();
+  if (S.cur === G.day) selectDay(G.day);
+}
+
+// Show a day the batch has started but that has no candidates on disk yet.
+function showPendingDay(day) {
+  S.cur = day;
+  renderNav();
+  const p = G.plan.find(function(x) { return x.date === day; });
+  document.getElementById('dateHdr').innerHTML = '<h2>' + longDate(day) + '</h2>'
+    + '<div class="meta">Generating' + (p && p.theme ? ' · Theme: ' + esc(p.theme) : '') + '</div>';
+  document.getElementById('regen').style.display = 'none';
+  document.getElementById('grid').innerHTML =
+    '<div class="state">Candidates will appear here as each one passes the gate…</div>';
 }
 
 // Parse one stdout line from generate.py. Returns true when a candidate
@@ -749,6 +1142,36 @@ function ingestLine(raw0) {
   if ((m = raw0.match(/^\[(\d+)\] ?([\s\S]*)$/))) { n = +m[1]; raw = m[2]; }
   const t = raw.trim();
   if (!t) return false;
+
+  // Day-level lines (unprefixed). A new day header resets the per-candidate
+  // state so its eight segments start fresh; in a single-day regenerate it
+  // arrives before any candidate, so the reset is a no-op there.
+  if (n === null && (m = t.match(/^Generating \d+ candidates for (\d{4}-\d{2}-\d{2})/))) {
+    if (G.kind === 'batch' && G.day && G.dayState[G.day] === 'active') G.dayState[G.day] = 'done';
+    G.c = {}; G.cur = 0; G.day = m[1];
+    if (G.kind === 'batch') {
+      G.dayState[m[1]] = 'active'; G.newDay = m[1];
+      const k = G.plan.findIndex(function(p) { return p.date === m[1]; }) + 1;
+      G.stage = 'Day ' + k + ' of ' + G.plan.length + ' · ' + shortDate(m[1]) + ' · starting';
+    }
+    G.all.push({ text: t, cls: '' });
+    return false;
+  }
+  if (n === null && (m = t.match(/^Skipping (\d{4}-\d{2}-\d{2})/))) {
+    G.dayState[m[1]] = 'skipped';
+    G.all.push({ text: t, cls: '' });
+    return false;
+  }
+  if (n === null && (m = t.match(/^!! (\d{4}-\d{2}-\d{2}): only.*slots \[([\d, ]*)\]/))) {
+    G.dayState[m[1]] = 'partial';           // falls through so the line is styled 'bad'
+    m[2].split(',').forEach(function(s) {   // backstop for output that didn't tag the slot
+      const k = +s.trim();
+      if (k && m[1] === G.day) { G.c[k] = G.c[k] || { frac: 0, retry: false, done: false }; G.c[k].failed = true; }
+    });
+  }
+  if (n === null && /^Done\./.test(t) && G.day && G.dayState[G.day] === 'active') {
+    G.dayState[G.day] = 'done';
+  }
   if (n === null && (m = t.match(/^Candidate (\d+)\/(\d+)/))) n = +m[1];   // unprefixed, sequential output
   if (n !== null) G.cur = n;
   const id = n !== null ? n : G.cur;
@@ -790,12 +1213,21 @@ function ingestLine(raw0) {
     cls = 'good'; c.frac = 0.97; c.retry = false; G.stage = who() + 'passed ✓';
   } else if (/^Gate budget exhausted|^Could not produce|^All pools exhausted/.test(t)) {
     cls = 'warn'; c.retry = true; G.stage = who() + t.charAt(0).toLowerCase() + t.slice(1);
+  } else if (/^!! candidate failed/.test(t)) {
+    cls = 'bad'; c.failed = true; c.retry = false;
+    G.stage = who() + 'failed — ' + t.replace(/^!! candidate failed:\s*/, '').slice(0, 80);
   } else if (/^First word .* collides/.test(t)) {
+    if (c.done) G.savedTotal--;              // its save is being redone, don't count it twice
     cls = 'warn'; c.retry = true; c.done = false; c.frac = 0.05;    // sent back for a new opening
     G.stage = who() + t.charAt(0).toLowerCase() + t.slice(1).replace(/ — regenerating.*$/, '') + ' — regenerating';
   } else if (/^Saved →/.test(t)) {
+    if (!c.done) G.savedTotal++;
     cls = 'good'; c.done = true; c.frac = 1; saved = true;
     G.stage = who() + 'saved ✓';
+  }
+  if (G.kind === 'batch' && c && G.day && !/^Day \d/.test(G.stage)) {
+    const k = G.plan.findIndex(function(p) { return p.date === G.day; }) + 1;
+    G.stage = 'Day ' + k + '/' + G.plan.length + ' · ' + shortDate(G.day) + ' · ' + G.stage;
   }
   if (/^Done\./.test(t)) cls = 'good';
   else if (/^Traceback|Error|^!!/.test(t)) cls = 'bad';
@@ -810,13 +1242,24 @@ function renderGen() {
     const n = i + 1, seg = segs[i], fill = seg.firstChild, c = G.c[n];
     let cls = 'seg', w = 0;
     if (c && c.done) { cls += ' saved'; w = 100; }
+    else if (c && c.failed) { cls += ' failed'; w = 100; }
     else if (c) { cls += ' active' + (c.retry ? ' retry' : ''); w = Math.round(c.frac * 100); }
     seg.className = cls;
     fill.style.width = w + '%';
   }
+  const countText = G.kind === 'batch'
+    ? savedCount() + ' / ' + TOTAL + ' this day · ' + G.savedTotal + ' / ' + (G.plan.length * TOTAL) + ' total'
+    : savedCount() + ' / ' + TOTAL + ' saved';
   document.getElementById('genStatus').innerHTML =
     '<span class="stage">' + esc(G.stage) + '</span>'
-    + '<span class="count">' + savedCount() + ' / ' + TOTAL + ' saved</span>';
+    + '<span class="count">' + countText + '</span>';
+  if (G.kind === 'batch') {
+    document.getElementById('genDays').innerHTML = G.plan.map(function(p) {
+      const s = G.dayState[p.date] || 'queued';
+      return '<span class="gday ' + s + '" title="' + esc(p.theme || '') + '">'
+        + (s === 'done' ? '✓ ' : s === 'partial' ? '! ' : '') + shortDate(p.date) + '</span>';
+    }).join('');
+  }
   const gen = document.getElementById('gen');
   const n = gen.classList.contains('fail') ? 14 : 9;
   document.getElementById('genFeed').innerHTML = G.all.slice(-n).map(function(x) {
@@ -826,9 +1269,12 @@ function renderGen() {
 
 async function finishGen(st) {
   clearInterval(G.timer);
+  G.running = false;
+  if (!document.getElementById('cmOverlay').hidden) refreshBusy().then(function() { cmChanged(true); });
   const gen = document.getElementById('gen');
   gen.classList.add(st.ok ? 'done' : 'fail');
   document.getElementById('genStop').hidden = true;
+  if (G.kind === 'batch') return finishBatch(st, gen);
   if (st.ok) { G.stage = 'Done — ' + savedCount() + ' candidates ready'; }
   else { G.stage = st.message; }
   renderGen();
@@ -845,9 +1291,271 @@ async function finishGen(st) {
   }
 }
 
+async function finishBatch(st, gen) {
+  const short = G.plan.filter(function(p) { return G.dayState[p.date] === 'partial'; });
+  const made = G.plan.filter(function(p) { return G.dayState[p.date] === 'done'; }).length + short.length;
+  const partial = short.length;
+  if (st.ok) {
+    G.stage = 'Done — ' + made + ' day' + (made === 1 ? '' : 's') + ', ' + G.savedTotal + ' candidates ready'
+      + (partial ? ' · short: ' + short.map(function(p) { return shortDate(p.date); }).join(', ') + ' (use Regenerate on that day)' : '');
+  } else {
+    G.stage = st.message + ' · ' + G.savedTotal + ' candidates were saved before it stopped';
+  }
+  renderGen();
+  const btn = document.getElementById('regenBtn');
+  btn.textContent = 'Regenerate';
+  btn.disabled = false;
+  S.days = await api('/api/status');
+  renderNav();
+  renderProgress();
+  // If the user let it run, land on the first new day so review can start;
+  // if they navigated away, leave them where they are.
+  const first = G.plan.find(function(p) { return S.days.some(function(d) { return d.date === p.date && !d.approved && d.count; }); });
+  if (G.follow && first) selectDay(first.date);
+  else if (S.cur) selectDay(S.cur);
+  if (st.ok) {
+    toast(st.message);
+    if (!partial) setTimeout(function() { gen.hidden = true; }, 6000);
+  }
+}
+
+function beginBatchPanel(label, plan, elapsedSec) {
+  Object.assign(G, { since: 0, cur: 0, all: [], c: {}, day: null,
+                     stage: 'Starting generator…',
+                     start: Date.now() - (elapsedSec || 0) * 1000,
+                     kind: 'batch', running: true, plan: plan || [], dayState: {},
+                     label: label, follow: true, newDay: null, savedTotal: 0 });
+  const gen = document.getElementById('gen');
+  gen.classList.remove('done', 'fail');
+  gen.hidden = false;
+  document.getElementById('genTitle').textContent = 'Generating ' + label;
+  document.getElementById('genStop').hidden = false;
+  document.getElementById('genSegs').innerHTML = '<div class="seg"><div class="fill"></div></div>'.repeat(TOTAL);
+  document.getElementById('genFeed').innerHTML = '';
+  const btn = document.getElementById('regenBtn');
+  btn.textContent = 'Generating…';
+  btn.disabled = true;
+  if (G.plan.length) showPendingDay(G.plan[0].date);
+  renderGen();
+  clearInterval(G.timer);
+  G.timer = setInterval(tickGen, 250);
+  tickGen();
+}
+
 async function cancelGeneration() {
   const res = await api('/api/regenerate/cancel', { method: 'POST' });
   toast(res.message);
+}
+
+/* ── Create dailies (the + panel) ───────── */
+// Every option generate.py has. The preview is computed by generate.py
+// itself (--dry-run) so it shows exactly what Generate will do, and the run
+// is pinned to the previewed dates.
+const CM = { opts: null, mode: 'next', dates: [], recipe: 'POLISHED', plan: null,
+             error: null, seq: 0, timer: null, busy: false };
+const CM_KEY = 'dehaiku.create.v1';
+
+async function openCreate() {
+  if (!CM.opts) {
+    CM.opts = await api('/api/generate/options');
+    document.getElementById('cmWorkers').innerHTML = Array.from({ length: CM.opts.max_workers }, function(_, i) {
+      const n = CM.opts.max_workers - i;
+      return '<option value="' + n + '">' + n + '</option>';
+    }).join('');
+    document.getElementById('cmRotation').textContent =
+      'Rotation (used when empty — each day gets the theme for its date): ' + CM.opts.rotation.join(' · ');
+    document.getElementById('cmStart').min = CM.opts.today;
+    document.getElementById('cmDateAdd').min = CM.opts.today;
+    loadCreateForm();
+  }
+  document.getElementById('cmOverlay').hidden = false;
+  await refreshBusy();
+  cmChanged(true);
+}
+
+function closeCreate() {
+  document.getElementById('cmOverlay').hidden = true;
+}
+
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'Escape' && !document.getElementById('cmOverlay').hidden) closeCreate();
+});
+
+async function refreshBusy() {
+  const st = await api('/api/regenerate/status');
+  CM.busy = !!st.running;
+  const el = document.getElementById('cmBusy');
+  el.hidden = !CM.busy;
+  if (CM.busy) el.textContent = 'Already generating ' + (st.label || st.date) + '. You can set up the next run, but Generate unlocks when this one finishes.';
+}
+
+function setMode(mode) {
+  CM.mode = mode;
+  document.querySelectorAll('#cmModes button').forEach(function(b) { b.classList.toggle('on', b.dataset.mode === mode); });
+  ['next', 'from', 'dates'].forEach(function(m) { document.getElementById('cmMode-' + m).hidden = m !== mode; });
+  if (mode === 'from' && !document.getElementById('cmStart').value) document.getElementById('cmStart').value = CM.opts.today;
+  cmChanged();
+}
+
+function setRecipe(v) {
+  CM.recipe = v;
+  document.querySelectorAll('#cmRecipes .recipe').forEach(function(b) { b.classList.toggle('on', b.dataset.v === v); });
+  cmChanged();
+}
+
+function addDate() {
+  const input = document.getElementById('cmDateAdd');
+  const v = input.value;
+  if (!v) return;
+  if (CM.dates.indexOf(v) < 0) CM.dates.push(v);
+  CM.dates.sort();
+  input.value = '';
+  renderChips();
+  cmChanged();
+}
+
+function removeDate(v) {
+  CM.dates = CM.dates.filter(function(d) { return d !== v; });
+  renderChips();
+  cmChanged();
+}
+
+function renderChips() {
+  document.getElementById('cmChips').innerHTML = CM.dates.map(function(d) {
+    return '<span class="chip">' + shortDate(d) + ' <button onclick="removeDate(\'' + d + '\')" aria-label="Remove">×</button></span>';
+  }).join('');
+}
+
+function readCreateForm() {
+  const themes = document.getElementById('cmThemes').value
+    .split(/[\n,]/).map(function(t) { return t.trim(); }).filter(Boolean);
+  const count = document.getElementById(CM.mode === 'from' ? 'cmCountFrom' : 'cmCountNext').value;
+  return {
+    mode: CM.mode,
+    count: count,
+    start: document.getElementById('cmStart').value,
+    dates: CM.dates.slice(),
+    themes: themes,
+    force: document.getElementById('cmForce').checked,
+    seeds: document.getElementById('cmSeeds').value.trim(),
+    version: CM.recipe,
+    workers: document.getElementById('cmWorkers').value,
+  };
+}
+
+function saveCreateForm() {
+  const f = readCreateForm();
+  f.countNext = document.getElementById('cmCountNext').value;
+  f.countFrom = document.getElementById('cmCountFrom').value;
+  f.themesRaw = document.getElementById('cmThemes').value;
+  try { localStorage.setItem(CM_KEY, JSON.stringify(f)); } catch (e) {}
+}
+
+function loadCreateForm() {
+  let f = null;
+  try { f = JSON.parse(localStorage.getItem(CM_KEY) || 'null'); } catch (e) {}
+  f = f || {};
+  document.getElementById('cmCountNext').value = f.countNext || CM.opts.lookahead;
+  document.getElementById('cmCountFrom').value = f.countFrom || CM.opts.lookahead;
+  if (f.start && f.start >= CM.opts.today) document.getElementById('cmStart').value = f.start;
+  CM.dates = (f.dates || []).filter(function(d) { return d >= CM.opts.today; });
+  renderChips();
+  document.getElementById('cmThemes').value = f.themesRaw || '';
+  document.getElementById('cmSeeds').value = f.seeds || '';
+  document.getElementById('cmForce').checked = !!f.force;
+  document.getElementById('cmWorkers').value = f.workers || CM.opts.max_workers;
+  const v = CM.opts.versions.indexOf(f.version) >= 0 ? f.version : CM.opts.default_version;
+  setRecipe(v);
+  setMode(['next', 'from', 'dates'].indexOf(f.mode) >= 0 ? f.mode : 'next');
+}
+
+// Debounced: ask generate.py for the plan whenever an option changes.
+function cmChanged(now) {
+  if (!CM.opts) return;
+  saveCreateForm();
+  clearTimeout(CM.timer);
+  CM.timer = setTimeout(refreshPreview, now ? 0 : 250);
+}
+
+async function refreshPreview() {
+  const seq = ++CM.seq;
+  const form = readCreateForm();
+  let res;
+  try {
+    res = await api('/api/generate/plan', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(form),
+    });
+  } catch (e) {
+    res = { ok: false, error: 'Could not reach the review server.' };
+  }
+  if (seq !== CM.seq) return;               // a newer edit superseded this one
+  CM.plan = res.ok ? res.plan : null;
+  CM.error = res.ok ? null : res.error;
+  const seedCount = form.seeds ? form.seeds.split(',').filter(function(w) { return w.trim(); }).length : 0;
+  if (!CM.error && seedCount > 11) CM.error = 'Seed words: at most 11 (the pool is 12).';
+  renderPreview(form);
+}
+
+function renderPreview(form) {
+  const box = document.getElementById('cmPreview');
+  const go = document.getElementById('cmGo');
+  const note = document.getElementById('cmFootNote');
+  if (CM.error) {
+    box.innerHTML = '<div class="cm-err">' + esc(CM.error) + '</div>';
+    go.disabled = true; go.textContent = 'Generate'; note.textContent = '';
+    return;
+  }
+  const plan = CM.plan || [];
+  const gen = plan.filter(function(p) { return p.action === 'generate'; });
+  const skipped = plan.length - gen.length;
+  const replaced = gen.filter(function(p) { return p.existing > 0; }).length;
+  const per = CM.opts.per_day;
+  let sub = [];
+  if (skipped) sub.push(skipped + ' approved day' + (skipped === 1 ? '' : 's') + ' skipped');
+  if (replaced) sub.push(replaced + ' replace unreviewed candidates');
+  const rows = plan.map(function(p) {
+    let badge;
+    if (p.action === 'skip') badge = '<span class="badge skip">approved · skipped</span>';
+    else if (p.approved) badge = '<span class="badge redo">approved · new candidates</span>';
+    else if (p.existing) badge = '<span class="badge repl">replaces ' + p.existing + ' unreviewed</span>';
+    else badge = '<span class="badge new">new</span>';
+    const d = new Date(p.date + 'T12:00:00');
+    return '<div class="prow' + (p.action === 'skip' ? ' skip' : '') + '">'
+      + '<span class="d"><b>' + shortDate(p.date) + '</b> ' + d.toLocaleDateString('en-US', { weekday: 'short' }) + '</span>'
+      + '<span class="th">' + esc(p.theme || '—') + '</span>' + badge + '</div>';
+  }).join('');
+  box.innerHTML = '<div class="sum"><span>' + gen.length + ' day' + (gen.length === 1 ? '' : 's') + ' · '
+    + (gen.length * per) + ' candidates</span><span class="sub">' + esc(sub.join(' · ')) + '</span></div>'
+    + (plan.length ? '<div class="rows">' + rows + '</div>' : '<div class="cm-err">No days selected.</div>');
+  note.textContent = gen.length && plan[0] && plan[0].date === CM.opts.today && form.mode === 'next'
+    ? 'Starts today — it has no puzzle yet.' : '';
+  go.disabled = CM.busy || !gen.length;
+  go.textContent = gen.length
+    ? 'Generate ' + gen.length + ' day' + (gen.length === 1 ? '' : 's') + ' (' + (gen.length * per) + ' candidates)'
+    : 'Generate';
+}
+
+async function startCreate() {
+  const form = readCreateForm();
+  const gen = (CM.plan || []).filter(function(p) { return p.action === 'generate'; });
+  if (!gen.length) return;
+  const replaced = gen.filter(function(p) { return p.existing > 0 && !p.approved; });
+  const redo = gen.filter(function(p) { return p.approved; });
+  const warn = [];
+  if (replaced.length) warn.push('This replaces unreviewed candidates on ' + replaced.map(function(p) { return shortDate(p.date); }).join(', ') + '.');
+  if (redo.length) warn.push('Already-approved days get new candidates: ' + redo.map(function(p) { return shortDate(p.date); }).join(', ') + ' (their live puzzle is kept).');
+  const msg = 'Generate ' + gen.length + ' day' + (gen.length === 1 ? '' : 's') + ' (' + (gen.length * CM.opts.per_day)
+    + ' candidates) with ' + form.version + '?' + (warn.length ? '\n\n' + warn.join('\n') : '')
+    + '\n\nThis calls the Claude API. Progress shows live below.';
+  if (!confirm(msg)) return;
+  const res = await api('/api/generate', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(form),
+  });
+  if (!res.ok) { alert(res.message); await refreshBusy(); cmChanged(true); return; }
+  closeCreate();
+  const st = await api('/api/regenerate/status');
+  beginBatchPanel(res.label, st.plan && st.plan.length ? st.plan : gen.map(function(p) { return { date: p.date, theme: p.theme }; }), 0);
+  pollGeneration();
 }
 
 /* ── Push ───────────────────────────────── */

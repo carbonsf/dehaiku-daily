@@ -101,8 +101,16 @@ python3 scripts/generate.py
 # Override themes (cycles across days — all 8 candidates per day share one theme)
 python3 scripts/generate.py --themes "winter wonderland,cozy cabin,holiday feast"
 
-# Specific start date (single day)
+# Specific dates (one, or several comma-separated)
 python3 scripts/generate.py --day 2026-06-15
+python3 scripts/generate.py --day 2026-06-15,2026-06-20
+
+# N open days (approved days are skipped and don't count), optionally from a start date
+python3 scripts/generate.py --count 14
+python3 scripts/generate.py --start 2026-12-01 --count 5
+
+# See exactly which days and themes a run would produce, without calling the API
+python3 scripts/generate.py --count 5 --themes "winter,cozy cabin" --dry-run
 
 # Pick the generation recipe (see "Versions" below; case-insensitive, default POLISHED)
 python3 scripts/generate.py --version hybrid
@@ -160,6 +168,7 @@ The review UI provides:
 - **Unapprove button** — undo an approval to re-pick
 - **Regenerate bar** — re-roll all candidates with optional theme override and seed words. Runs `generate.py` as a subprocess (always the current version on disk) and shows a live panel: one bar per candidate, the current stage (drawing words, writing, rewriting and why, solver probes), the generator's output feed, elapsed time, and a Stop button. Cards appear in the grid as each candidate passes the gate.
 - **Commit & Push** — stage and push all approved puzzles to GitHub
+- **＋ Create dailies** (the + after the date pills) — generate any number of days without the terminal. Every `generate.py` option is there: next N open days / N days from a start date / specific dates, include-approved, themes (cycle across days; empty = rotation), seed words, recipe, and how many candidates run at once. A live **preview** shows each day, its theme, and whether it's new, replaces unreviewed candidates, or is skipped; it's computed by `generate.py --dry-run`, and the run is pinned to the previewed dates, so what you see is what runs. During the run, queued days show as dashed pills, the active day pulses, and the live panel adds a day strip and a running total; the view follows along until you click a pill. Options are remembered between sessions.
 
 ### `purge.py` — Unapprove / delete
 
