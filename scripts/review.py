@@ -731,7 +731,7 @@ header h1{font-size:16px;font-weight:600;letter-spacing:.02em}
 .chip button:hover{background:rgba(30,64,175,.15)}
 .cm-check{display:flex;gap:8px;align-items:flex-start;font-size:13px;margin-top:12px;cursor:pointer}
 .cm-check input{margin-top:2px}
-.recipes{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.recipes{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}
 @media(max-width:560px){.recipes{grid-template-columns:1fr}}
 .recipe{border:2px solid var(--border);border-radius:10px;padding:10px 12px;cursor:pointer;text-align:left;background:var(--surface);font-family:inherit;color:var(--text)}
 .recipe:hover{border-color:#b0b0b0}
@@ -782,6 +782,7 @@ header h1{font-size:16px;font-weight:600;letter-spacing:.02em}
     <option value="POLISHED">POLISHED</option>
     <option value="CHOPPED">CHOPPED</option>
     <option value="HYBRID">HYBRID</option>
+    <option value="LANDED">LANDED</option>
   </select>
   <button class="regen-btn" id="regenBtn" onclick="regenerate()">Regenerate</button>
   <div class="hint">Re-rolls all 8 candidates. Theme overrides the rotation; seed words get mixed into the 12-word pool. Version picks the recipe (see README); each card shows which one made it.</div>
@@ -850,6 +851,7 @@ header h1{font-size:16px;font-weight:600;letter-spacing:.02em}
           <button class="recipe" data-v="POLISHED" onclick="setRecipe('POLISHED')"><b>POLISHED</b><span>Punctuated sentence with a turn; line-end commas stripped. Default.</span></button>
           <button class="recipe" data-v="CHOPPED" onclick="setRecipe('CHOPPED')"><b>CHOPPED</b><span>The no-commas recipe: bare, terse, imagistic lines.</span></button>
           <button class="recipe" data-v="HYBRID" onclick="setRecipe('HYBRID')"><b>HYBRID</b><span>CHOPPED's prompt on POLISHED's checks.</span></button>
+          <button class="recipe" data-v="LANDED" onclick="setRecipe('LANDED')"><b>LANDED</b><span>Built as one plain-spoken sentence with the last line settled first. Aimed at word-salad endings.</span></button>
         </div>
       </div>
 

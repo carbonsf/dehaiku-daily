@@ -206,7 +206,7 @@ python3 scripts/review.py
 
 ## Versions
 
-`--version` (CLI) or the dropdown in the review UI's regenerate bar picks one of three recipes. They differ in exactly four places; the model, effort, word pool, leak check, syllables, craft probe and gate are shared. Each candidate records which recipe made it (`"version"` in the JSON, shown as a badge on its card), so you can A/B them day by day.
+`--version` (CLI), the dropdown in the review UI's regenerate bar, or the recipe cards in the + panel pick one of four recipes. The first three differ in exactly four places; the model, effort, word pool, leak check, syllables, craft probe and gate are shared. LANDED (below the table) changes how the poem is built. Each candidate records which recipe made it (`"version"` in the JSON, shown as a badge on its card), so you can A/B them day by day.
 
 | | CHOPPED | POLISHED (default) | HYBRID |
 |---|---|---|---|
@@ -218,6 +218,34 @@ python3 scripts/review.py
 | Feel | bare, terse, imagistic; retries often | punctuated sentence with a turn; witty landings | CHOPPED's voice at the prompt, POLISHED's economy at the gate |
 
 CHOPPED and POLISHED are the recipes exactly as they shipped (commits `eb38079` and `8a42b06`); the implementations are kept verbatim in `generate.py` and selected by a table (`VERSION_SPEC`), which is also where you'd compose a new mix.
+
+### LANDED
+
+Aimed at one failure the other three share: the poem decays toward its end into word salad ("catgut brow lifts from foam", "worms ogle grinders").
+
+**Why it happens.** The model writes left to right, spends line one on the theme, and packs whatever words are left into the last five syllables. The cheapest way to pack is a coined label ("chrome fish", "throat's bell") with no grammar joining it to anything. The gate's rewrite loop makes it worse: told a word is unfindable, the model bolts it onto the end.
+
+**What LANDED does instead.** It changes the build order rather than adding rules about the surface. The model thinks before it answers, so it can follow an order:
+
+1. Find one moment where all four words are naturally present, and say it as a single sentence of prose first.
+2. Settle the last line before the others: where that sentence lands, carrying at most one of the four words.
+3. Write the two lines that lead to it. Hide each word in what is *happening*, never in a coined label.
+
+When the gate asks for a rewrite, a rider points the fix at the scene ("change what happens") instead of the words. LANDED otherwise uses POLISHED's structure check, feedback and comma strip, gets more room to think (`max_tokens` 8000), and trusts the API's stop reason over the last-word-length truncation guess, which misreads plain short endings like "the penned dogs howl too".
+
+**How it was tested (Nov 2026).** No API key was available, so generation ran through stand-in agents on the pipeline's model (`claude-opus-5-5`) with the pipeline's exact prompts; two blind judges scored shuffled, unlabeled poems 1-5 and agreed closely (r = 0.9). The stand-in reproduces the problem: its CHOPPED and POLISHED drafts scored the same as real on-disk output. These are first drafts, not full gated runs, and the samples are small.
+
+| | Last-line quality (1-5) | Flagged as word salad |
+|---|---|---|
+| CHOPPED, first draft (n=15) | 3.0 | 8 / 15 |
+| POLISHED, first draft (n=15) | 2.2 | 11 / 15 |
+| **LANDED, first draft (n=20)** | **3.5** | **4 / 20** |
+| CHOPPED, after a gate rewrite (n=6) | 2.1 | 4 / 6 |
+| **LANDED, after a gate rewrite (n=6)** | **3.3** | 2 / 6 |
+
+A held-out run on ten untouched word pools replicated the direction with a smaller effect (endings +0.55; better on 6, tied on 2, worse on 2). Solver stand-ins found LANDED puzzles no easier and no harder than the others. It is not a cure: some quartets have no shared scene, and every recipe fails on those.
+
+**Tried and dropped: a random sentence shape per call.** Drawing a shape each time ("one sentence through all three lines", "end on a question"…) scored *lower* than the same recipe without it (endings 3.3 vs 3.9, worse on 5 of 10 paired sets) and caused more mid-phrase line breaks. One more constraint costs more than the variety buys. It is off by default; `LANDED_SHAPE=1` turns it on.
 
 ## Theme rotation
 

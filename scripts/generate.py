@@ -374,11 +374,29 @@ def looks_truncated(lines: list[str]) -> bool:
 #             tolerant check, gentle feedback and comma strip (rejection
 #             is what costs retries and flattens the output).
 #
+#   LANDED    (2026-11) aimed at one failure the others share: the poem
+#             decays toward its end into "word salad". The cause is
+#             debt — the model writes left to right, spends line one on
+#             the theme, and packs whatever words are left into the last
+#             five syllables as coined labels ("catgut brow", "throat's
+#             bell") with no grammar joining them. LANDED changes how the
+#             poem is BUILT rather than adding rules about its surface:
+#             find one moment and say it as a prose sentence first, settle
+#             the last line before the others, and hide words in what
+#             happens rather than in labels. When the gate asks for a
+#             rewrite, a rider points the fix at the scene, not the words.
+#             Uses POLISHED's check, feedback and comma strip. Three extra
+#             spec keys, absent from the rows above: `compose` (the build
+#             block and the gate rider), `max_tokens` (the planning this
+#             asks for needs more room to think) and `truncation` (trust
+#             the API's stop reason over a last-word-length guess, which
+#             misfires on plain short endings).
+#
 # The table below is the whole definition of each version. Each row names
 # which implementation of the four parts to use; the implementations
-# themselves are kept verbatim from the commits above.
+# of the first three are kept verbatim from the commits above.
 
-VERSIONS = ("POLISHED", "CHOPPED", "HYBRID")
+VERSIONS = ("POLISHED", "CHOPPED", "HYBRID", "LANDED")
 VERSION = "POLISHED"  # set once from --version in main(); see set_version()
 
 VERSION_SPEC = {
@@ -386,6 +404,8 @@ VERSION_SPEC = {
     "CHOPPED":  dict(check="chopped",  bullet="chopped",  feedback="chopped",  strip=False),
     "POLISHED": dict(check="polished", bullet="polished", feedback="polished", strip=True),
     "HYBRID":   dict(check="polished", bullet="chopped",  feedback="hybrid",   strip=True),
+    "LANDED":   dict(check="polished", bullet="landed",   feedback="polished", strip=True,
+                     compose="landed", max_tokens=8000, truncation="stop_reason"),
 }
 
 
@@ -525,11 +545,89 @@ _BULLET_POLISHED = (
     "line break and stop a word into the next line, and don't bolt "
     "a leftover clue onto the last line as a tail."
 )
-_BULLETS = {"chopped": _BULLET_CHOPPED, "polished": _BULLET_POLISHED}
+_BULLET_LANDED = (
+    "• Plain speech. Read aloud, the three lines must sound like something "
+    "a person would say: ordinary grammar, with its subjects, its verbs and "
+    "its small words (the, a, his, in). Hide each word in what is "
+    "HAPPENING, never in a coined label for it — no stacked noun phrases, "
+    "no made-up compounds standing in for a word."
+)
+_BULLETS = {"chopped": _BULLET_CHOPPED, "polished": _BULLET_POLISHED,
+            "landed": _BULLET_LANDED}
 
 
 def structure_bullet() -> str:
     return _BULLETS[_spec()["bullet"]]
+
+
+# --- LANDED: how the poem is built ------------------------------------------
+# The model thinks before it answers, so a build ORDER is something it can
+# actually follow. This block goes before CONSTRAINTS; the other versions
+# have no compose block and their prompts are unchanged.
+
+_COMPOSE_LANDED = (
+    "HOW TO BUILD THIS ONE:\n"
+    "1. Before writing any line, find the single moment — someone doing "
+    "something, in one place — where all four words are naturally present, "
+    "and say it to yourself as one plain sentence of prose. If it won't go "
+    "into a sentence you don't have the poem yet; find a different moment.\n"
+    "2. Settle the LAST line first. It is where that sentence lands — its "
+    "payoff or its turn — in words a person would say aloud. It carries at "
+    "most one of the four words, and it is never where leftover words get "
+    "packed.\n"
+    "3. Then write the two lines that lead to it, and cut to 5/7/5, "
+    "ending each line where the sentence would naturally pause."
+)
+
+# OFF by default. Drawing a sentence shape per call was tested blind
+# against the same recipe without it and scored lower (last-line quality
+# 3.30 vs 3.90 out of 5; worse on 5 of 10 paired word sets, better on 3)
+# and caused more mid-phrase line breaks — one more constraint to juggle
+# costs more than the variety buys, and the angle cue already varies the
+# poems. Set LANDED_SHAPE=1 in the environment to try it anyway.
+LANDED_SHAPE_ON = os.environ.get("LANDED_SHAPE", "").strip() == "1"
+LANDED_SHAPES = [
+    "one sentence running through all three lines, its verb or payoff "
+    "arriving in the last",
+    "two lines that set the scene, then a short plain last line that "
+    "undercuts or answers them",
+    "an opening line that stands alone, then one sentence across lines "
+    "two and three",
+    "a first-person speaker caught in the middle of doing something",
+    'spoken to someone as "you"',
+    "ending on a few words somebody says out loud",
+    "ending on a question",
+    "a command or a warning",
+]
+
+
+# The gate's rewrite request says "more obliquely" or "weave the missing
+# word in", and the model answers it without seeing its previous attempt.
+# The cheap way to comply is at the word level — swap a plain phrase for a
+# riddling label, or bolt the missing word on — which is exactly the
+# salad. This rider, added after the gate's feedback, points the fix at
+# the scene instead.
+_GATE_RIDER_LANDED = (
+    "Make that fix by changing what HAPPENS — pick a different moment or "
+    "a different action — never by swapping plain words for a riddling "
+    "label or bolting a clue on. The build order above still applies: one "
+    "sentence of plain speech, last line settled first."
+)
+
+
+def gate_rider() -> str | None:
+    """Extra guidance appended to gate feedback for the active version."""
+    return _GATE_RIDER_LANDED if _spec().get("compose") == "landed" else None
+
+
+def compose_block() -> str | None:
+    """Extra build instructions for the active version, or None."""
+    if _spec().get("compose") != "landed":
+        return None
+    block = _COMPOSE_LANDED
+    if LANDED_SHAPE_ON and LANDED_SHAPES:
+        block += f"\nSHAPE for this one: {random.choice(LANDED_SHAPES)}."
+    return block
 
 
 def structure_feedback_text(issue: str) -> str:
@@ -697,6 +795,12 @@ def generate_haiku(
             f"{', '.join(banned_words)}"
         )
 
+    # Build instructions (LANDED only; None for every other version)
+    compose = compose_block()
+    if compose:
+        parts.append("")
+        parts.append(compose)
+
     # Constraints block (v8 — matches production buildSoloPrompt)
     parts.append("")
     parts.append("CONSTRAINTS (the game breaks if you violate these):")
@@ -748,6 +852,9 @@ def generate_haiku(
     if gate_feedback:
         parts.append("")
         parts.append(gate_feedback)
+        rider = gate_rider()  # LANDED only; None for every other version
+        if rider:
+            parts.append(rider)
 
     # Line-structure feedback from check_structure() or craft_probe()
     if structure_feedback:
@@ -760,7 +867,7 @@ def generate_haiku(
     # lines, or the haiku gets cut off mid-poem.
     response = client.messages.create(
         model=MODEL,
-        max_tokens=4000,
+        max_tokens=_spec().get("max_tokens", 4000),
         output_config={"effort": EFFORT},
         system=SYSTEM_MESSAGE,
         messages=[{"role": "user", "content": "\n".join(parts)}],
@@ -771,7 +878,15 @@ def generate_haiku(
     lines = [line.strip() for line in text.split("\n") if line.strip()]
     if len(lines) != 3:
         raise ValueError(f"Expected 3 lines, got {len(lines)}: {text!r}")
-    if looks_truncated(lines):
+    if _spec().get("truncation") == "stop_reason":
+        # LANDED asks for plain-spoken endings, and those often finish on a
+        # short ordinary word ("the penned dogs howl too", "Kiss my sewn-up
+        # lip") that the length heuristic below misreads as a cut-off —
+        # 3 of 10 in testing, every one a false alarm. Ask the API instead
+        # whether the response actually ran out of room.
+        if getattr(response, "stop_reason", None) == "max_tokens":
+            raise ValueError("Haiku was cut off (response hit max_tokens)")
+    elif looks_truncated(lines):
         raise ValueError(f"Haiku looks truncated: {lines[-1]!r}")
     structure_issue = check_structure(lines)
     if structure_issue:
