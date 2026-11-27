@@ -132,7 +132,7 @@ python3 scripts/generate.py --day 2026-12-25 --themes "christmas" --seeds "tree,
 1. Draw 12 random words from `config/words.json` (+ any user seeds) — words are NOT themed
 2. Randomly split: 4 answer words, 8 decoys
 3. Generate a haiku encoding the 4 answers — theme applied HERE (sets mood/setting only)
-4. Leak check: if any answer word or its stem appears in the haiku, retry with feedback
+4. Leak check: if any answer word or its stem appears in the haiku, retry with feedback. The 8 decoys get the same check — the generator never sees them, but a decoy printed in the haiku reads as a clue, so the draft is rejected and the retry is told which words to avoid (rare: 2 of 179 approved puzzles had one)
 5. Truncation guard: verify the haiku isn't cut off
 6. **Line structure** — targets one defect only: a phrase that spills over a line break and stops a word or two into the next line, leaving a bolted-on tail (`silence in the tobacco / sack; we lose, he sighs`). **Punctuation is not the defect.** The poems that work are punctuated sentences (dash after line one, comma after line two, period to land). An earlier version banned commas and capped dashes; it rejected 87% of hand-approved puzzles and flattened the output into three bare noun phrases. Don't widen these rules without re-measuring against `puzzles/`.
    - *Layer 1 — deterministic, free:* reject a line that runs on with no closing punctuation and either ends on a function word (`the`, `of`, `like`…) or stops within two words of the next line. Rejects ~4% of approved puzzles, all of which have the defect.

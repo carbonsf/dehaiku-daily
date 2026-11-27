@@ -1141,10 +1141,18 @@ def generate_puzzle(
                     # Layer 1 (check_structure) passed — clear stale feedback
                     struct_fb = None
                     leaks = leaked_words(candidate, answer_words)
-                    if leaks:
-                        leak_fb = leaks
+                    # The 8 decoys get the same check. The generator is
+                    # never shown them, so it can't avoid one on a first
+                    # draft — but a decoy printed in the haiku reads to a
+                    # player as a clue, so the draft is rejected and the
+                    # retry is told which words to keep out. When no decoy
+                    # appears this is a no-op and behaviour is unchanged.
+                    decoy_hits = leaked_words(candidate, decoy_words)
+                    if leaks or decoy_hits:
+                        leak_fb = leaks + decoy_hits
+                        shown = leaks + [f"{w} (decoy)" for w in decoy_hits]
                         log(
-                            f"    Haiku leaked {leaks} "
+                            f"    Haiku leaked {shown} "
                             f"(try {h_try}/{HAIKU_RETRIES})"
                         )
                         continue
